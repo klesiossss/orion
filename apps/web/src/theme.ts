@@ -1,0 +1,203 @@
+import {
+  normalizeHexColor,
+  type AccentPreset,
+  type BackdropPreset,
+  type HexColor,
+} from './theme-colors.js'
+
+export type Theme = 'dark' | 'light'
+export type ThemeColorScheme = 'dark' | 'light'
+export type ThemePreference = Theme | 'system'
+export type FontPreset = 'geist' | 'inter' | 'system' | 'humanist' | 'rounded' | 'serif' | 'mono'
+export type LocalFontPreference = `local:${string}`
+export type FontPreference = FontPreset | LocalFontPreference
+export type AccentPreference = AccentPreset | HexColor
+export type BackdropPreference = BackdropPreset | HexColor
+export type AppearancePreference = {
+  font: FontPreference
+  accent: AccentPreference
+  backdrop: BackdropPreference
+  glass: number
+}
+export type AppearancePreferences = {
+  light: AppearancePreference
+  dark: AppearancePreference
+}
+
+export function appearanceKey(key: string, theme: Theme): string {
+  return `${key}.${theme}`
+}
+
+function readAppearanceValue(key: string, theme?: Theme): string | null {
+  return (theme ? readStored(appearanceKey(key, theme)) : null) ?? readStored(key)
+}
+
+export function readAppearancePreferences(): AppearancePreferences {
+  const read = (theme: Theme): AppearancePreference => ({
+    font: readFontPreference(theme),
+    accent: readAccentPreference(theme),
+    backdrop: readBackdropPreference(theme),
+    glass: readGlassPreference(theme),
+  })
+  return { light: read('light'), dark: read('dark') }
+}
+
+/** With site data blocked, touching localStorage throws SecurityError — and
+ *  these run during module init, where a throw is a white screen. */
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+export const THEME_KEY = 'harness.theme'
+export const FONT_KEY = 'harness.font'
+export const ACCENT_KEY = 'harness.accent'
+export const BACKDROP_KEY = 'harness.backdrop'
+// v2: the default changed from Off to Medium. The v1 key is deliberately
+// abandoned — every install under the old default had "0" auto-written on
+// mount, which would pin the new default to Off forever.
+export const GLASS_KEY = 'harness.sidebarGlass2'
+export const DARK_THEME_QUERY = '(prefers-color-scheme: dark)'
+const LOCAL_FONT_PREFIX = 'local:'
+const MAX_LOCAL_FONT_FAMILY_LENGTH = 256
+const FONT_PRESETS = new Set<FontPreset>([
+  'geist',
+  'inter',
+  'system',
+  'humanist',
+  'rounded',
+  'serif',
+  'mono',
+])
+
+export function readThemePreference(): ThemePreference {
+  const stored = readStored(THEME_KEY)
+  return stored === 'dark' || stored === 'light' || stored === 'system' ? stored : 'system'
+}
+
+export function readSystemTheme(): ThemeColorScheme {
+  return (globalThis.matchMedia?.(DARK_THEME_QUERY).matches ?? true) ? 'dark' : 'light'
+}
+
+export function resolveTheme(preference: ThemePreference): Theme {
+  return preference === 'system' ? readSystemTheme() : preference
+}
+
+export function colorSchemeForTheme(theme: Theme): ThemeColorScheme {
+  return theme === 'light' ? 'light' : 'dark'
+}
+
+export function applyTheme(theme: Theme): void {
+  document.documentElement.dataset.theme = theme
+  document.documentElement.classList.toggle('dark', colorSchemeForTheme(theme) === 'dark')
+}
+
+export function readFontPreference(theme?: Theme): FontPreference {
+  const stored = readAppearanceValue(FONT_KEY, theme)
+  if (FONT_PRESETS.has(stored as FontPreset)) return stored as FontPreset
+  if (stored?.startsWith(LOCAL_FONT_PREFIX)) {
+    return fontPreferenceForFamily(stored.slice(LOCAL_FONT_PREFIX.length)) ?? 'system'
+  }
+  return 'system'
+}
+
+export function fontPreferenceForFamily(family: string): LocalFontPreference | undefined {
+  const normalized = family.trim()
+  if (
+    normalized.length === 0 ||
+    normalized.length > MAX_LOCAL_FONT_FAMILY_LENGTH ||
+    /\p{Cc}/u.test(normalized)
+  ) {
+    return undefined
+  }
+  return `${LOCAL_FONT_PREFIX}${normalized}`
+}
+
+export function fontFamilyFromPreference(font: FontPreference): string | undefined {
+  if (!font.startsWith(LOCAL_FONT_PREFIX)) return undefined
+  const family = font.slice(LOCAL_FONT_PREFIX.length)
+  return fontPreferenceForFamily(family)?.slice(LOCAL_FONT_PREFIX.length)
+}
+
+/** The CSS font-family a preference sets, for type that shows a font other than the app's own. */
+export function fontFamilyStack(font: FontPreference): string {
+  const localFamily = fontFamilyFromPreference(font)
+  if (localFamily) return `${JSON.stringify(localFamily)}, system-ui, sans-serif`
+  if (font === 'system' || !FONT_PRESETS.has(font as FontPreset)) return 'var(--font-system)'
+  return `var(--font-${font})`
+}
+
+export function applyFontPreference(font: FontPreference): void {
+  const root = document.documentElement
+  const localFamily = fontFamilyFromPreference(font)
+  root.dataset.font = localFamily ? 'local' : font
+  if (localFamily) {
+    root.style.setProperty('--font-ui', fontFamilyStack(font))
+  } else {
+    root.style.removeProperty('--font-ui')
+  }
+}
+
+export function readAccentPreference(theme?: Theme): AccentPreference {
+  const stored = readAppearanceValue(ACCENT_KEY, theme)
+  const custom = stored?.startsWith('#') ? normalizeHexColor(stored) : undefined
+  if (custom) return custom
+  return stored === 'ocean' ||
+    stored === 'forest' ||
+    stored === 'sunset' ||
+    stored === 'amber' ||
+    stored === 'rose' ||
+    stored === 'lavender'
+    ? stored
+    : 'neutral'
+}
+
+export function applyAccentPreference(accent: AccentPreference): void {
+  const root = document.documentElement
+  const custom = normalizeHexColor(accent)
+  root.dataset.accent = custom ? 'custom' : accent
+  if (custom) root.style.setProperty('--custom-accent', custom)
+  else root.style.removeProperty('--custom-accent')
+}
+
+export function readBackdropPreference(theme?: Theme): BackdropPreference {
+  const stored = readAppearanceValue(BACKDROP_KEY, theme)
+  const custom = stored?.startsWith('#') ? normalizeHexColor(stored) : undefined
+  if (custom) return custom
+  return stored === 'slate' ||
+    stored === 'mocha' ||
+    stored === 'forest' ||
+    stored === 'midnight' ||
+    stored === 'plum'
+    ? stored
+    : 'default'
+}
+
+export function applyBackdropPreference(backdrop: BackdropPreference): void {
+  const root = document.documentElement
+  const custom = normalizeHexColor(backdrop)
+  root.dataset.backdrop = custom ? 'custom' : backdrop
+  if (custom) root.style.setProperty('--custom-backdrop', custom)
+  else root.style.removeProperty('--custom-backdrop')
+}
+
+/**
+ * Sidebar translucency in percent, 0 (opaque) to 60 — anything above that
+ * makes text sit on too little contrast to read comfortably. Defaults to
+ * Medium (35): the glass is meant to be seen, not discovered in a submenu.
+ */
+export function readGlassPreference(theme?: Theme): number {
+  const raw = readAppearanceValue(GLASS_KEY, theme)
+  if (raw === null || raw === '') return 35
+  const stored = Number(raw)
+  return Number.isFinite(stored) ? Math.min(60, Math.max(0, Math.round(stored))) : 35
+}
+
+export function applyGlassPreference(glass: number): void {
+  const root = document.documentElement
+  root.dataset.glass = glass > 0 ? 'on' : 'off'
+  root.style.setProperty('--rail-glass', String(glass / 100))
+}

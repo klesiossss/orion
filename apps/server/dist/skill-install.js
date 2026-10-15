@@ -1,0 +1,124 @@
+import { constants, statSync } from 'node:fs';
+import { access, cp, lstat, mkdir, readdir, realpath, rm, stat } from 'node:fs/promises';
+import path from 'node:path';
+import { z } from 'zod';
+const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+function inside(root, candidate) {
+    const relative = path.relative(root, candidate);
+    return (relative === '' ||
+        (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)));
+}
+/**
+ * Whether two spellings name the same folder. A provider may report a path
+ * with different drive or directory casing; string comparison would call a
+ * successful install missing. Filesystem identity avoids folding case on a
+ * case-sensitive volume.
+ */
+export function sameSkillFolder(reported, destination) {
+    if (path.resolve(reported) === path.resolve(destination))
+        return true;
+    const left = statSync(reported, { bigint: true, throwIfNoEntry: false });
+    const right = statSync(destination, { bigint: true, throwIfNoEntry: false });
+    if (!left || !right)
+        return false;
+    // Some Windows volumes report no file index; their folders are case-insensitive.
+    if (left.ino === 0n || right.ino === 0n)
+        return (process.platform === 'win32' &&
+            path.resolve(reported).toLowerCase() === path.resolve(destination).toLowerCase());
+    return left.dev === right.dev && left.ino === right.ino;
+}
+/** Whether a reported file lies below the installed folder, under any spelling. */
+export function insideSkillFolder(reported, destination) {
+    for (let folder = path.dirname(path.resolve(reported));; folder = path.dirname(folder)) {
+        if (sameSkillFolder(folder, destination))
+            return true;
+        if (path.dirname(folder) === folder)
+            return false;
+    }
+}
+async function exists(candidate) {
+    return lstat(candidate).then(() => true, (error) => {
+        if (error.code === 'ENOENT')
+            return false;
+        throw error;
+    });
+}
+async function validateTree(root, current, ancestors = new Set()) {
+    const canonical = await realpath(current);
+    if (!inside(root, canonical)) {
+        throw new Error(`skill folder contains a symlink outside the selected folder: ${current}`);
+    }
+    const info = await stat(current);
+    if (!info.isDirectory())
+        return;
+    if (ancestors.has(canonical))
+        throw new Error('skill folder contains a symbolic-link cycle');
+    const nextAncestors = new Set(ancestors).add(canonical);
+    for (const entry of await readdir(current)) {
+        await validateTree(root, path.join(current, entry), nextAncestors);
+    }
+}
+async function managedRoot(projectPath) {
+    const project = await realpath(projectPath);
+    if (!(await stat(project)).isDirectory())
+        throw new Error('project path is not a folder');
+    const agents = path.join(project, '.agents');
+    const managed = path.join(agents, 'skills');
+    for (const candidate of [agents, managed]) {
+        if ((await exists(candidate)) && !inside(project, await realpath(candidate))) {
+            throw new Error('project skill location points outside the project');
+        }
+    }
+    await mkdir(managed, { recursive: true });
+    const canonical = await realpath(managed);
+    if (!inside(project, canonical))
+        throw new Error('project skill location points outside the project');
+    return canonical;
+}
+export async function installLocalSkill(projectPath, folderPath) {
+    const source = await realpath(folderPath);
+    if (!(await stat(source)).isDirectory())
+        throw new Error('selected skill path is not a folder');
+    const skillFile = path.join(source, 'SKILL.md');
+    await access(skillFile, constants.R_OK).catch(() => {
+        throw new Error('selected folder must contain a readable SKILL.md');
+    });
+    if (!(await stat(skillFile)).isFile()) {
+        throw new Error('selected folder must contain a readable SKILL.md');
+    }
+    await validateTree(source, source);
+    const name = path.basename(source);
+    if (!name || name === '.' || name === '..' || WINDOWS_RESERVED.test(name) || /[. ]$/.test(name)) {
+        throw new Error(`skill folder name is not portable: ${name || '(empty)'}`);
+    }
+    const root = await managedRoot(projectPath);
+    if (inside(source, root))
+        throw new Error('selected skill folder cannot contain the managed skill location');
+    const destination = path.join(root, name);
+    try {
+        await mkdir(destination);
+    }
+    catch (error) {
+        const parsed = z.object({ code: z.string().optional() }).safeParse(error);
+        if (parsed.success && parsed.data.code === 'EEXIST') {
+            throw new Error(`project skill "${name}" already exists`);
+        }
+        throw error;
+    }
+    try {
+        for (const entry of await readdir(source)) {
+            await cp(path.join(source, entry), path.join(destination, entry), {
+                recursive: true,
+                dereference: true,
+                errorOnExist: true,
+                force: false,
+            });
+        }
+        return destination;
+    }
+    catch (error) {
+        await rm(destination, { recursive: true, force: true });
+        throw error;
+    }
+}
+//# sourceMappingURL=skill-install.js.map

@@ -1,0 +1,983 @@
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { Transport } from '../transport.js'
+import { McpSettings } from './McpSettings.js'
+
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
+
+function client(request: (method: string, params: unknown) => Promise<unknown>): Transport {
+  return {
+    state: 'open',
+    request: vi.fn(request),
+    on: vi.fn(() => () => {}),
+    onState: vi.fn(() => () => {}),
+  } as unknown as Transport
+}
+
+describe('MCP settings', () => {
+  it('offers project setup without inherited controls when live inventory is unavailable', async () => {
+    const transport = client(async () => ({
+      capabilities: {
+        inventory: false,
+        add: true,
+        update: true,
+        remove: true,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [
+        {
+          id: 'docs',
+          scope: 'project',
+          enabled: true,
+          transport: { type: 'http', url: 'https://docs.example.test/mcp' },
+          tools: [],
+          resources: [],
+          resourceTemplates: [],
+        },
+      ],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="claude-code"
+        providerName="Claude Code"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+    expect(await screen.findByRole('button', { name: 'Add server' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Remove' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Hide server by ID' })).toBeNull()
+    expect(screen.queryByRole('switch')).toBeNull()
+    expect(screen.getByText('Changes apply when you start or resume a session.')).toBeTruthy()
+  })
+
+  it('hides an inherited server by ID without inventing transport or changing global settings', async () => {
+    const requests: unknown[] = []
+    const transport = client(async (method, params) => {
+      if (method === 'mcp.list')
+        return {
+          capabilities: {
+            inventory: true,
+            add: true,
+            update: true,
+            remove: true,
+            reload: false,
+            startOAuth: false,
+            cancelOAuth: false,
+          },
+          servers: [],
+        }
+      if (method === 'mcp.add') {
+        requests.push(params)
+        return {}
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Hide server by ID' }))
+    const field = screen.getByLabelText('Server ID')
+    expect(document.activeElement).toBe(field)
+    expect(screen.queryByLabelText('Transport JSON')).toBeNull()
+    fireEvent.change(field, { target: { value: ' inherited-docs ' } })
+    fireEvent.submit(screen.getByRole('form', { name: 'Hide inherited MCP server' }))
+    await screen.findByText('Server hidden for this project.')
+    expect(requests).toEqual([
+      {
+        provider: 'codex',
+        projectPath: '/work/project',
+        server: { id: 'inherited-docs', enabled: false },
+      },
+    ])
+    expect(screen.getByText('Changes apply when you start or resume a session.')).toBeTruthy()
+  })
+
+  it('cancels a hide form with Escape and restores keyboard focus', async () => {
+    const transport = client(async () => ({
+      capabilities: { inventory: true, add: true },
+      servers: [],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="grok"
+        providerName="Grok"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+    const action = await screen.findByRole('button', { name: 'Hide server by ID' })
+    act(() => action.focus())
+    fireEvent.click(action)
+    fireEvent.keyDown(screen.getByLabelText('Server ID'), { key: 'Escape' })
+    expect(screen.queryByRole('form')).toBeNull()
+    expect(document.activeElement).toBe(action)
+  })
+
+  it('keeps the form open when Escape cancels an IME composition', async () => {
+    const transport = client(async () => ({
+      capabilities: { inventory: true, add: true },
+      servers: [],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Add server' }))
+    fireEvent.keyDown(screen.getByLabelText('Server ID'), { key: 'Escape', isComposing: true })
+    expect(screen.getByRole('form')).toBeTruthy()
+  })
+
+  it('returns focus to the last action when switching between editor modes', async () => {
+    const transport = client(async () => ({
+      capabilities: { inventory: true, add: true },
+      servers: [],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+    const hide = await screen.findByRole('button', { name: 'Hide server by ID' })
+    const add = screen.getByRole('button', { name: 'Add server' })
+    fireEvent.click(hide)
+    act(() => add.focus())
+    fireEvent.click(add)
+    fireEvent.keyDown(screen.getByLabelText('Server ID'), { key: 'Escape' })
+    expect(document.activeElement).toBe(add)
+  })
+  it('shows live inventory, failures, tools, and starts OAuth', async () => {
+    const transport = client(async (method) => {
+      if (method === 'mcp.list') {
+        return {
+          capabilities: {
+            inventory: true,
+            add: true,
+            update: true,
+            remove: true,
+            reload: true,
+            startOAuth: true,
+            cancelOAuth: false,
+          },
+          servers: [
+            {
+              id: 'docs',
+              displayName: 'Developer Docs',
+              scope: 'project',
+              enabled: true,
+              auth: { status: 'sign_in_required', method: 'oauth' },
+              startup: { state: 'failed', message: 'OAuth token expired' },
+              tools: [
+                {
+                  name: 'search_docs',
+                  description: 'Search official docs.',
+                  inputSchema: { type: 'object' },
+                },
+              ],
+              resources: [],
+              resourceTemplates: [],
+            },
+          ],
+        }
+      }
+      if (method === 'mcp.startOAuth') {
+        return { loginId: 'login-1', authUrl: 'https://auth.example.test/' }
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('Developer Docs')).toBeTruthy()
+    expect(screen.getByText('Codex · MCP inventory available')).toBeTruthy()
+    expect(screen.getByRole('status').getAttribute('aria-live')).toBe('polite')
+    expect(screen.queryByText('Available in Project')).toBeNull()
+    expect(screen.getByText('OAuth token expired')).toBeTruthy()
+    fireEvent.click(screen.getByText(/1 tools/))
+    expect(screen.getByText('search_docs')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
+
+    await waitFor(() => {
+      expect(transport.request).toHaveBeenCalledWith('mcp.startOAuth', {
+        provider: 'codex',
+        projectPath: '/work/project',
+        serverId: 'docs',
+      })
+      expect(open).toHaveBeenCalledWith(
+        'https://auth.example.test/',
+        '_blank',
+        'noopener,noreferrer',
+      )
+    })
+  })
+
+  it('keeps rendering when a legacy live server has no auth or startup status', async () => {
+    const transport = client(async () => ({
+      capabilities: {
+        inventory: true,
+        add: false,
+        update: false,
+        remove: false,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [
+        {
+          id: 'legacy-server',
+          scope: 'project',
+          enabled: true,
+          tools: [],
+          resources: [],
+          resourceTemplates: [],
+        },
+      ],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('legacy-server')).toBeTruthy()
+    expect(screen.getByText('status unavailable')).toBeTruthy()
+  })
+
+  it('starts empty when the provider only reports global servers', async () => {
+    const transport = client(async () => ({
+      capabilities: {
+        inventory: true,
+        add: true,
+        update: true,
+        remove: true,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [
+        {
+          id: 'provider-global',
+          scope: 'global',
+          enabled: true,
+          auth: { status: 'not_required' },
+          startup: { state: 'ready' },
+          tools: [],
+          resources: [],
+          resourceTemplates: [],
+        },
+      ],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('No MCP servers have been added to this project.')).toBeTruthy()
+    expect(screen.queryByText('provider-global')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Add server' })).toBeTruthy()
+  })
+
+  it('shows no controls for unsupported providers', async () => {
+    const transport = client(async () => ({
+      capabilities: {
+        inventory: false,
+        add: false,
+        update: false,
+        remove: false,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="claude-code"
+        providerName="Claude Code"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText(/Provider-global inventory is unavailable/)).toBeTruthy()
+    expect(screen.getByText('Claude Code · MCP inventory unavailable')).toBeTruthy()
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+  })
+
+  it('switches providers before adding a project server', async () => {
+    const transport = client(async (method, params) => {
+      if (method === 'mcp.list') {
+        const provider = (params as { provider: string }).provider
+        return {
+          capabilities: {
+            inventory: provider === 'codex',
+            add: true,
+            update: true,
+            remove: true,
+            reload: provider === 'codex',
+            startOAuth: provider === 'codex',
+            cancelOAuth: false,
+          },
+          servers: [],
+        }
+      }
+      if (method === 'mcp.add') return {}
+      if (method === 'mcp.reload') return {}
+      throw new Error(`unexpected ${method}`)
+    })
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        providers={[
+          { provider: 'codex', providerName: 'Codex' },
+          { provider: 'grok', providerName: 'Grok' },
+        ]}
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    const picker = await screen.findByRole('combobox', { name: 'MCP provider' })
+    expect(picker.textContent).toContain('Codex')
+    fireEvent.click(picker)
+    fireEvent.click(await screen.findByRole('option', { name: 'Grok' }))
+
+    expect(await screen.findByText('Grok · MCP inventory unavailable')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Add server' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Server ID' }), {
+      target: { value: 'test-tools' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save server' }))
+
+    await waitFor(() =>
+      expect(transport.request).toHaveBeenCalledWith('mcp.add', {
+        provider: 'grok',
+        projectPath: '/work/project',
+        server: {
+          id: 'test-tools',
+          enabled: true,
+          transport: { type: 'http', url: 'https://example.com/mcp' },
+        },
+      }),
+    )
+    expect(transport.request).not.toHaveBeenCalledWith(
+      'mcp.reload',
+      expect.objectContaining({ provider: 'grok' }),
+    )
+  })
+
+  it('reports inventory separately when configuration remains available', async () => {
+    const transport = client(async () => ({
+      capabilities: {
+        inventory: false,
+        add: true,
+        update: true,
+        remove: true,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [],
+    }))
+    render(
+      <McpSettings
+        transport={transport}
+        provider="grok"
+        providerName="Grok"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('Grok · MCP inventory unavailable')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Add server' })).toBeTruthy()
+  })
+
+  it('replaces the loading state with a retryable error', async () => {
+    const transport = client(async () => {
+      throw new Error('Codex did not respond')
+    })
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect((await screen.findByRole('alert')).textContent).toContain('Codex did not respond')
+    expect(screen.getByText('Codex · MCP inventory status unavailable')).toBeTruthy()
+    expect(screen.queryByText('Loading MCP servers…')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(transport.request).toHaveBeenCalledTimes(2))
+  })
+
+  it('recovers inventory after the connection reopens', async () => {
+    let onState: ((state: 'open' | 'reconnecting') => void) | undefined
+    const transport = {
+      state: 'open',
+      request: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('Connection to the server was lost.'))
+        .mockResolvedValueOnce({
+          capabilities: {
+            inventory: true,
+            add: false,
+            update: false,
+            remove: false,
+            reload: false,
+            startOAuth: false,
+            cancelOAuth: false,
+          },
+          servers: [],
+        }),
+      on: vi.fn(() => () => {}),
+      onState: vi.fn((listener: typeof onState) => {
+        onState = listener
+        return () => undefined
+      }),
+    } as unknown as Transport
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByRole('alert')).toBeTruthy()
+    act(() => onState?.('reconnecting'))
+    act(() => onState?.('open'))
+
+    expect(await screen.findByText('No MCP servers have been added to this project.')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('refreshes when background MCP discovery finishes', async () => {
+    const listeners = new Map<string, (value: never) => void>()
+    const transport = {
+      state: 'open',
+      request: vi.fn(async () => ({
+        capabilities: {
+          inventory: true,
+          add: true,
+          update: true,
+          remove: true,
+          reload: true,
+          startOAuth: true,
+          cancelOAuth: false,
+        },
+        servers: [],
+      })),
+      on: vi.fn((channel: string, listener: (value: never) => void) => {
+        listeners.set(channel, listener)
+        return () => listeners.delete(channel)
+      }),
+      onState: vi.fn(() => () => {}),
+    } as unknown as Transport
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    await waitFor(() => expect(transport.request).toHaveBeenCalledTimes(1))
+    listeners.get('mcp.changed')?.({ provider: 'codex', projectPath: '/work/project' } as never)
+    await waitFor(() => expect(transport.request).toHaveBeenCalledTimes(2))
+  })
+
+  it('keeps the current inventory visible during a background refresh', async () => {
+    const listeners = new Map<string, (value: never) => void>()
+    let resolveRefresh: ((value: unknown) => void) | undefined
+    const refresh = new Promise((resolve) => {
+      resolveRefresh = resolve
+    })
+    const inventory = {
+      capabilities: {
+        inventory: true,
+        add: false,
+        update: false,
+        remove: false,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [
+        {
+          id: 'docs',
+          scope: 'project' as const,
+          enabled: true,
+          auth: { status: 'not_required' as const },
+          startup: { state: 'ready' as const },
+          tools: [],
+          resources: [],
+          resourceTemplates: [],
+        },
+      ],
+    }
+    let lists = 0
+    const transport = {
+      state: 'open',
+      request: vi.fn(async (method: string) => {
+        if (method === 'mcp.list') return lists++ === 0 ? inventory : refresh
+        throw new Error(`unexpected ${method}`)
+      }),
+      on: vi.fn((channel: string, listener: (value: never) => void) => {
+        listeners.set(channel, listener)
+        return () => listeners.delete(channel)
+      }),
+      onState: vi.fn(() => () => {}),
+    } as unknown as Transport
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('docs')).toBeTruthy()
+    act(() =>
+      listeners.get('mcp.changed')?.({
+        provider: 'codex',
+        projectPath: '/work/project',
+      } as never),
+    )
+    await waitFor(() => expect(transport.request).toHaveBeenCalledTimes(2))
+
+    expect(screen.getByText('docs')).toBeTruthy()
+    expect(screen.queryByText('Loading MCP servers…')).toBeNull()
+
+    await act(async () => resolveRefresh?.(inventory))
+  })
+
+  it('keeps a blocked-popup notice and prevents duplicate OAuth attempts until completion', async () => {
+    const listeners = new Map<string, (value: never) => void>()
+    const transport = {
+      state: 'open',
+      request: vi.fn(async (method: string) => {
+        if (method === 'mcp.list') {
+          return {
+            capabilities: {
+              inventory: true,
+              add: false,
+              update: false,
+              remove: false,
+              reload: false,
+              startOAuth: true,
+              cancelOAuth: false,
+            },
+            servers: [
+              {
+                id: 'docs',
+                scope: 'project',
+                enabled: true,
+                auth: { status: 'sign_in_required', method: 'oauth' },
+                startup: { state: 'ready' },
+                tools: [],
+                resources: [],
+                resourceTemplates: [],
+              },
+            ],
+          }
+        }
+        if (method === 'mcp.startOAuth') {
+          return { loginId: 'login-1', authUrl: 'https://auth.example.test/' }
+        }
+        throw new Error(`unexpected ${method}`)
+      }),
+      on: vi.fn((channel: string, listener: (value: never) => void) => {
+        listeners.set(channel, listener)
+        return () => listeners.delete(channel)
+      }),
+      onState: vi.fn(() => () => {}),
+    } as unknown as Transport
+    vi.spyOn(window, 'open').mockImplementation(() => null)
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    const signIn = await screen.findByRole('button', { name: 'Sign in' })
+    fireEvent.click(signIn)
+
+    expect(
+      await screen.findByText(
+        'Your browser blocked the sign-in window. Open it yourself: https://auth.example.test/',
+      ),
+    ).toBeTruthy()
+    expect((signIn as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(signIn)
+    expect(
+      vi.mocked(transport.request).mock.calls.filter(([method]) => method === 'mcp.startOAuth'),
+    ).toHaveLength(1)
+
+    act(() =>
+      listeners.get('mcp.oauth')?.({
+        provider: 'codex',
+        projectPath: '/work/project',
+        serverId: 'docs',
+        loginId: 'another-login',
+        success: true,
+        error: null,
+      } as never),
+    )
+    expect((signIn as HTMLButtonElement).disabled).toBe(true)
+
+    act(() =>
+      listeners.get('mcp.oauth')?.({
+        provider: 'codex',
+        projectPath: '/work/project',
+        serverId: 'docs',
+        loginId: 'login-1',
+        success: true,
+        error: null,
+      } as never),
+    )
+    expect(await screen.findByText('MCP sign-in completed.')).toBeTruthy()
+    expect((signIn as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('settles OAuth when completion arrives before the start response', async () => {
+    const listeners = new Map<string, (value: never) => void>()
+    let resolveStart: ((value: { loginId: string; authUrl: string }) => void) | undefined
+    const start = new Promise<{ loginId: string; authUrl: string }>((resolve) => {
+      resolveStart = resolve
+    })
+    const transport = {
+      state: 'open',
+      request: vi.fn(async (method: string) => {
+        if (method === 'mcp.list') {
+          return {
+            capabilities: {
+              inventory: true,
+              add: false,
+              update: false,
+              remove: false,
+              reload: false,
+              startOAuth: true,
+              cancelOAuth: false,
+            },
+            servers: [
+              {
+                id: 'docs',
+                scope: 'project',
+                enabled: true,
+                auth: { status: 'sign_in_required', method: 'oauth' },
+                startup: { state: 'ready' },
+                tools: [],
+                resources: [],
+                resourceTemplates: [],
+              },
+            ],
+          }
+        }
+        if (method === 'mcp.startOAuth') return start
+        throw new Error(`unexpected ${method}`)
+      }),
+      on: vi.fn((channel: string, listener: (value: never) => void) => {
+        listeners.set(channel, listener)
+        return () => listeners.delete(channel)
+      }),
+      onState: vi.fn(() => () => {}),
+    } as unknown as Transport
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    const signIn = await screen.findByRole('button', { name: 'Sign in' })
+    fireEvent.click(signIn)
+    act(() =>
+      listeners.get('mcp.oauth')?.({
+        provider: 'codex',
+        projectPath: '/work/project',
+        serverId: 'docs',
+        loginId: 'login-1',
+        success: true,
+        error: null,
+      } as never),
+    )
+    expect((signIn as HTMLButtonElement).disabled).toBe(true)
+
+    await act(async () =>
+      resolveStart?.({ loginId: 'login-1', authUrl: 'https://auth.example.test/' }),
+    )
+
+    expect(await screen.findByText('MCP sign-in completed.')).toBeTruthy()
+    expect((signIn as HTMLButtonElement).disabled).toBe(false)
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('ignores a completed change after switching projects', async () => {
+    Object.defineProperty(window, 'confirm', { configurable: true, value: () => true })
+    let finishChange: (() => void) | undefined
+    const change = new Promise<void>((resolve) => {
+      finishChange = resolve
+    })
+    const inventory = (id: string) => ({
+      capabilities: {
+        inventory: true,
+        add: true,
+        update: false,
+        remove: true,
+        reload: false,
+        startOAuth: false,
+        cancelOAuth: false,
+      },
+      servers: [
+        {
+          id,
+          scope: 'project',
+          enabled: true,
+          auth: { status: 'not_required' },
+          startup: { state: 'ready' },
+          tools: [],
+          resources: [],
+          resourceTemplates: [],
+        },
+      ],
+    })
+    const transport = client(async (method, params) => {
+      const projectPath = (params as { projectPath: string }).projectPath
+      if (method === 'mcp.list') return inventory(projectPath === '/work/alpha' ? 'alpha' : 'beta')
+      if (method === 'mcp.remove') return change
+      throw new Error(`unexpected ${method}`)
+    })
+    const view = render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/alpha"
+        projectName="Alpha"
+      />,
+    )
+
+    expect(await screen.findByText('alpha')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    view.rerender(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/beta"
+        projectName="Beta"
+      />,
+    )
+    expect(screen.getByText('Checking Codex MCP support…')).toBeTruthy()
+    expect(await screen.findByText('beta')).toBeTruthy()
+
+    await act(async () => finishChange?.())
+
+    expect(screen.getByText('beta')).toBeTruthy()
+    expect(
+      vi
+        .mocked(transport.request)
+        .mock.calls.filter(
+          ([method, params]) =>
+            method === 'mcp.list' &&
+            (params as { projectPath: string }).projectPath === '/work/alpha',
+        ),
+    ).toHaveLength(1)
+  })
+
+  it('keeps a row locked until its own change settles', async () => {
+    Object.defineProperty(window, 'confirm', { configurable: true, value: () => true })
+    const finishRemove = new Map<string, () => void>()
+    const server = (id: string) => ({
+      id,
+      scope: 'project',
+      enabled: true,
+      auth: { status: 'not_required' },
+      startup: { state: 'ready' },
+      tools: [],
+      resources: [],
+      resourceTemplates: [],
+    })
+    const transport = client(async (method, params) => {
+      if (method === 'mcp.list') {
+        return {
+          capabilities: {
+            inventory: true,
+            add: true,
+            update: false,
+            remove: true,
+            reload: false,
+            startOAuth: false,
+            cancelOAuth: false,
+          },
+          servers: [server('alpha'), server('beta')],
+        }
+      }
+      if (method === 'mcp.remove') {
+        return new Promise<void>((resolve) =>
+          finishRemove.set((params as { serverId: string }).serverId, resolve),
+        )
+      }
+      throw new Error(`unexpected ${method}`)
+    })
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('beta')).toBeTruthy()
+    const [alphaRemove, betaRemove] = screen.getAllByRole('button', { name: 'Remove' })
+    fireEvent.click(alphaRemove!)
+    fireEvent.click(betaRemove!)
+    expect((alphaRemove as HTMLButtonElement).disabled).toBe(true)
+    act(() => finishRemove.get('alpha')?.())
+
+    await waitFor(() => expect((alphaRemove as HTMLButtonElement).disabled).toBe(false))
+    expect((betaRemove as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(betaRemove!)
+    expect(
+      vi
+        .mocked(transport.request)
+        .mock.calls.filter(([method]) => method === 'mcp.remove')
+        .map(([, params]) => (params as { serverId: string }).serverId),
+    ).toEqual(['alpha', 'beta'])
+  })
+
+  it('adds and removes project servers', async () => {
+    Object.defineProperty(window, 'confirm', { configurable: true, value: () => true })
+    const transport = client(async (method) => {
+      if (method === 'mcp.list') {
+        return {
+          capabilities: {
+            inventory: true,
+            add: true,
+            update: true,
+            remove: true,
+            reload: true,
+            startOAuth: true,
+            cancelOAuth: false,
+          },
+          servers: [
+            {
+              id: 'github',
+              scope: 'project',
+              enabled: true,
+              auth: { status: 'not_required' },
+              startup: { state: 'ready' },
+              tools: [],
+              resources: [],
+              resourceTemplates: [],
+            },
+          ],
+        }
+      }
+      if (method === 'mcp.add' || method === 'mcp.reload' || method === 'mcp.remove') return {}
+      throw new Error(`unexpected ${method}`)
+    })
+    render(
+      <McpSettings
+        transport={transport}
+        provider="codex"
+        providerName="Codex"
+        projectPath="/work/project"
+        projectName="Project"
+      />,
+    )
+
+    expect(await screen.findByText('github')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Add server' }))
+    fireEvent.change(screen.getByLabelText('Server ID'), { target: { value: 'docs' } })
+    fireEvent.change(screen.getByLabelText('Transport JSON', { exact: false }), {
+      target: { value: '{"type":"http","url":"https://docs.example.test/mcp"}' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save server' }))
+
+    await waitFor(() => {
+      expect(transport.request).toHaveBeenCalledWith('mcp.add', {
+        provider: 'codex',
+        projectPath: '/work/project',
+        server: {
+          id: 'docs',
+          enabled: true,
+          transport: { type: 'http', url: 'https://docs.example.test/mcp' },
+        },
+      })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    await waitFor(() => {
+      expect(transport.request).toHaveBeenCalledWith('mcp.remove', {
+        provider: 'codex',
+        projectPath: '/work/project',
+        serverId: 'github',
+      })
+    })
+  })
+})

@@ -1,0 +1,596 @@
+// @vitest-environment happy-dom
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { SessionSearchResult } from '@harness/contracts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { TestTransport } from '../test-transport.js'
+import { SessionSearch } from './SessionSearch.js'
+
+const RESULT: SessionSearchResult = {
+  projectPath: 'D:\\repo',
+  projectName: 'TasteCode',
+  threadId: 'thread-1',
+  threadTitle: 'Fix regression',
+  turnId: 'turn-2',
+  provider: 'codex',
+  createdAt: 42,
+  snippet: [
+    { text: 'The ', highlighted: false },
+    { text: 'regression', highlighted: true },
+    { text: ' started here.', highlighted: false },
+  ],
+}
+
+const PROJECTS = [
+  {
+    path: 'D:\\repo',
+    name: 'TasteCode',
+    sessions: [
+      {
+        id: 'title-thread',
+        title: 'Regression planning',
+        provider: 'codex' as const,
+        createdAt: 44,
+      },
+      {
+        id: 'grok-thread',
+        title: 'Unrelated Grok chat',
+        provider: 'grok' as const,
+        createdAt: 43,
+      },
+      {
+        id: 'claude-thread',
+        title: 'Claude roadmap',
+        provider: 'claude-code' as const,
+        createdAt: 42,
+      },
+    ],
+  },
+]
+
+describe('cross-session search', () => {
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('contains forward and reverse Tab navigation inside the modal', () => {
+    render(
+      <SessionSearch
+        transport={new TestTransport()}
+        projects={PROJECTS}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+    const search = screen.getByRole('combobox', { name: 'Search every chat' })
+    const agent = screen.getByRole('combobox', { name: 'Agent' })
+    expect(document.activeElement).toBe(search)
+
+    fireEvent.keyDown(search, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(agent)
+
+    fireEvent.keyDown(agent, { key: 'Tab' })
+    expect(document.activeElement).toBe(search)
+  })
+
+  it('highlights title matches whose folded form changes length', () => {
+    const titles = ['İzmir deploy', 'ｄｅｐｌｏｙ checklist', 'Cafe\u0301 deploy']
+    render(
+      <SessionSearch
+        transport={new TestTransport()}
+        projects={[
+          {
+            path: 'D:\\repo',
+            name: 'TasteCode',
+            sessions: titles.map((title, index) => ({
+              id: `thread-${index}`,
+              title,
+              provider: 'codex' as const,
+              createdAt: index,
+            })),
+          },
+        ]}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+    const search = screen.getByRole('combobox', { name: 'Search every chat' })
+    const marks = () => Array.from(document.querySelectorAll('mark'), (mark) => mark.textContent)
+
+    fireEvent.change(search, { target: { value: 'deploy' } })
+    expect(marks().sort()).toEqual(['deploy', 'deploy', 'ｄｅｐｌｏｙ'])
+
+    fireEvent.change(search, { target: { value: 'café' } })
+    expect(marks()).toEqual(['Cafe\u0301'])
+  })
+
+  it('highlights a Greek title match that ends in a capital sigma', () => {
+    render(
+      <SessionSearch
+        transport={new TestTransport()}
+        projects={[
+          {
+            path: 'D:\\repo',
+            name: 'TasteCode',
+            sessions: [{ id: 'greek', title: 'ΟΔΟΣ plan', provider: 'codex', createdAt: 0 }],
+          },
+        ]}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Search every chat' }), {
+      target: { value: 'οδος' },
+    })
+
+    expect(Array.from(document.querySelectorAll('mark'), (mark) => mark.textContent)).toEqual([
+      'ΟΔΟΣ',
+    ])
+  })
+
+  it('does not keep old content results when the next query fails', async () => {
+    vi.useFakeTimers()
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({ results: [RESULT], nextCursor: 'next' })
+      .mockRejectedValueOnce(new Error('Search unavailable'))
+    const onSelect = vi.fn()
+    render(
+      <SessionSearch
+        transport={new TestTransport((method, params) => request(method, params))}
+        projects={PROJECTS}
+        onSelect={onSelect}
+        onClose={() => undefined}
+      />,
+    )
+    const input = screen.getByLabelText('Search every chat')
+    fireEvent.change(input, { target: { value: 'regression' } })
+    await act(() => vi.advanceTimersByTimeAsync(80))
+    expect(screen.getByRole('option', { name: /Fix regression/ })).toBeTruthy()
+
+    fireEvent.change(input, { target: { value: 'unmatched query' } })
+    await act(() => vi.advanceTimersByTimeAsync(80))
+    expect(screen.getByText('Search unavailable')).toBeTruthy()
+    expect(screen.queryByRole('option', { name: /Fix regression/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Load more results' })).toBeNull()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it('finds titles immediately, searches quickly, and supports keyboard navigation', async () => {
+    vi.useFakeTimers()
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({ results: [RESULT], nextCursor: 'page-2' })
+      .mockResolvedValueOnce({
+        results: [{ ...RESULT, turnId: 'turn-3', createdAt: 43 }],
+        nextCursor: null,
+      })
+    const onSelect = vi.fn()
+    render(
+      <SessionSearch
+        transport={new TestTransport((method, params) => request(method, params))}
+        projects={PROJECTS}
+        onSelect={onSelect}
+        onClose={() => undefined}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('combobox', { name: 'Project' }))
+    fireEvent.click(screen.getByRole('option', { name: 'TasteCode' }))
+    fireEvent.click(screen.getByRole('combobox', { name: 'Agent' }))
+    expect(
+      screen
+        .getAllByRole('option', { name: /^(All agents|Claude Code|Codex|Grok)$/ })
+        .map((option) => option.textContent),
+    ).toEqual(['All agents', 'Claude Code', 'Codex', 'Grok'])
+    expect(screen.queryByRole('option', { name: 'Cursor' })).toBeNull()
+    fireEvent.click(screen.getByRole('option', { name: 'Codex' }))
+    const search = screen.getByLabelText('Search every chat')
+    fireEvent.change(search, { target: { value: 'regres' } })
+
+    expect(screen.getByRole('option', { name: /Regression planning/ })).toBeTruthy()
+    fireEvent.keyDown(search, { key: 'Enter', isComposing: true })
+    expect(onSelect).not.toHaveBeenCalled()
+    fireEvent.keyDown(search, { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledWith('title-thread', undefined)
+    onSelect.mockClear()
+    expect(request).not.toHaveBeenCalled()
+    await act(async () => {
+      vi.advanceTimersByTime(79)
+      await Promise.resolve()
+    })
+    expect(request).not.toHaveBeenCalled()
+    await act(async () => {
+      vi.advanceTimersByTime(1)
+      await Promise.resolve()
+    })
+
+    expect(request).toHaveBeenCalledWith('search.sessions', {
+      query: 'regres',
+      projectPath: 'D:\\repo',
+      provider: 'codex',
+      limit: 20,
+    })
+    expect(screen.getByText('regression').tagName).toBe('MARK')
+    fireEvent.keyDown(search, { key: 'ArrowDown' })
+    fireEvent.keyDown(search, { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledWith('thread-1', 'turn-2')
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+      await Promise.resolve()
+    })
+    expect(request).toHaveBeenLastCalledWith('search.sessions', {
+      query: 'regres',
+      projectPath: 'D:\\repo',
+      provider: 'codex',
+      cursor: 'page-2',
+      limit: 20,
+    })
+    expect(screen.getAllByRole('option', { name: /Fix regression/ })).toHaveLength(2)
+  })
+
+  it('keeps hovered results and Enter activation in sync', async () => {
+    vi.useFakeTimers()
+    const request = vi.fn().mockResolvedValueOnce({ results: [RESULT], nextCursor: null })
+    const onSelect = vi.fn()
+    render(
+      <SessionSearch
+        transport={new TestTransport((method, params) => request(method, params))}
+        projects={PROJECTS}
+        onSelect={onSelect}
+        onClose={() => undefined}
+      />,
+    )
+
+    const search = screen.getByLabelText('Search every chat')
+    fireEvent.change(search, { target: { value: 'regres' } })
+    await act(async () => {
+      vi.advanceTimersByTime(80)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const hovered = screen.getByRole('option', { name: /Fix regression/ })
+    fireEvent.mouseEnter(hovered)
+    fireEvent.keyDown(search, { key: 'Enter' })
+
+    expect(hovered.getAttribute('aria-selected')).toBe('true')
+    expect(onSelect).toHaveBeenCalledWith('thread-1', 'turn-2')
+  })
+
+  it('shows pending state immediately and ignores a stale response', async () => {
+    vi.useFakeTimers()
+    let resolveFirst:
+      ((value: { results: SessionSearchResult[]; nextCursor: null }) => void) | undefined
+    let resolveSecond:
+      ((value: { results: SessionSearchResult[]; nextCursor: null }) => void) | undefined
+    const request = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSecond = resolve
+          }),
+      )
+    render(
+      <SessionSearch
+        transport={new TestTransport((method, params) => request(method, params))}
+        projects={PROJECTS}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    const search = screen.getByLabelText('Search every chat')
+    fireEvent.change(search, { target: { value: 'first' } })
+    expect(screen.getByText('Searching…')).toBeTruthy()
+    await act(async () => vi.advanceTimersByTime(80))
+
+    fireEvent.change(search, { target: { value: 'second' } })
+    expect(screen.getByText('Searching…')).toBeTruthy()
+    await act(async () => vi.advanceTimersByTime(80))
+
+    await act(async () => {
+      resolveFirst?.({ results: [RESULT], nextCursor: null })
+      await Promise.resolve()
+    })
+    expect(screen.queryByText('regression')).toBeNull()
+
+    await act(async () => {
+      resolveSecond?.({
+        results: [
+          {
+            ...RESULT,
+            threadTitle: 'Second result',
+            snippet: [{ text: 'second', highlighted: true }],
+          },
+        ],
+        nextCursor: null,
+      })
+      await Promise.resolve()
+    })
+    expect(screen.getByRole('option', { name: /Second result/ })).toBeTruthy()
+  })
+
+  it('keeps settled message results visible while the next query loads', async () => {
+    vi.useFakeTimers()
+    let resolveRefresh:
+      ((value: { results: SessionSearchResult[]; nextCursor: null }) => void) | undefined
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({ results: [RESULT], nextCursor: null })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRefresh = resolve
+          }),
+      )
+    render(
+      <SessionSearch
+        transport={new TestTransport((method, params) => request(method, params))}
+        projects={PROJECTS}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    const search = screen.getByLabelText('Search every chat')
+    fireEvent.change(search, { target: { value: 'regres' } })
+    await act(async () => {
+      vi.advanceTimersByTime(80)
+      await Promise.resolve()
+    })
+    expect(screen.getByText('Messages and output')).toBeTruthy()
+    expect(screen.getByRole('option', { name: /Fix regression/ })).toBeTruthy()
+
+    fireEvent.change(search, { target: { value: 'second' } })
+    expect(screen.getByText('Messages and output')).toBeTruthy()
+    expect(screen.getByRole('option', { name: /Fix regression/ })).toBeTruthy()
+    await act(async () => vi.advanceTimersByTime(80))
+    expect(screen.getByText('Messages and output')).toBeTruthy()
+
+    await act(async () => {
+      resolveRefresh?.({
+        results: [
+          {
+            ...RESULT,
+            threadTitle: 'Second result',
+            snippet: [{ text: 'second', highlighted: true }],
+          },
+        ],
+        nextCursor: null,
+      })
+      await Promise.resolve()
+    })
+    expect(screen.queryByRole('option', { name: /Fix regression/ })).toBeNull()
+    expect(screen.getByRole('option', { name: /Second result/ })).toBeTruthy()
+  })
+
+  it('shows title and content matches with their source product name', async () => {
+    const transport = new TestTransport(async () => ({
+      results: [
+        {
+          ...RESULT,
+          threadId: 'claude-thread',
+          threadTitle: 'Claude roadmap',
+          provider: 'claude-code',
+        },
+      ],
+      nextCursor: null,
+    }))
+    render(
+      <SessionSearch
+        transport={transport}
+        projects={PROJECTS}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    fireEvent.change(screen.getByLabelText('Search every chat'), { target: { value: 'roadmap' } })
+    await waitFor(() => {
+      expect(screen.getAllByRole('option', { name: /Claude roadmap.*Claude Code/ })).toHaveLength(2)
+    })
+    for (const option of screen.getAllByRole('option', { name: /Claude roadmap.*Claude Code/ })) {
+      const identity = option.querySelector('.source-identity')
+      expect(identity?.getAttribute('title')).toBe('Claude Code')
+      expect(identity?.querySelector('svg')?.getAttribute('width')).toBe('11')
+      expect(identity?.querySelector('path')?.getAttribute('d')).toContain('M17.3041 3.541')
+    }
+  })
+
+  it('keeps same-turn, same-timestamp content hits distinct by server identity', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const onSelect = vi.fn()
+    const transport = new TestTransport(async () => ({
+      results: [
+        { ...RESULT, resultId: 'message:item-1' },
+        { ...RESULT, resultId: 'tool:item-2' },
+      ],
+      nextCursor: null,
+    }))
+    render(
+      <SessionSearch
+        transport={transport}
+        projects={[]}
+        onSelect={onSelect}
+        onClose={() => undefined}
+      />,
+    )
+
+    fireEvent.change(screen.getByLabelText('Search every chat'), {
+      target: { value: 'regression' },
+    })
+
+    const hits = await screen.findAllByRole('option', { name: /Fix regression/ })
+    expect(hits).toHaveLength(2)
+    fireEvent.click(hits[0]!)
+    fireEvent.click(hits[1]!)
+    expect(onSelect).toHaveBeenNthCalledWith(1, 'thread-1', 'turn-2')
+    expect(onSelect).toHaveBeenNthCalledWith(2, 'thread-1', 'turn-2')
+    expect(consoleError.mock.calls.flat().join(' ')).not.toContain('same key')
+  })
+
+  it('keeps the focused result selected when title rows are inserted ahead of it', async () => {
+    const transport = new TestTransport(async () => ({
+      results: [{ ...RESULT, resultId: 'message:item-1' }],
+      nextCursor: null,
+    }))
+    const view = render(
+      <SessionSearch
+        transport={transport}
+        projects={PROJECTS}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Search every chat'), {
+      target: { value: 'regression' },
+    })
+    const contentHit = await screen.findByRole('option', { name: /Fix regression/ })
+    act(() => contentHit.focus())
+    await waitFor(() => expect(contentHit.getAttribute('aria-selected')).toBe('true'))
+
+    view.rerender(
+      <SessionSearch
+        transport={transport}
+        projects={[
+          {
+            ...PROJECTS[0]!,
+            sessions: [
+              ...PROJECTS[0]!.sessions,
+              {
+                id: 'new-title-thread',
+                title: 'Regression urgent',
+                provider: 'codex' as const,
+                createdAt: 100,
+              },
+            ],
+          },
+        ]}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    expect(screen.getByRole('option', { name: /Fix regression/ })).toBe(contentHit)
+    expect(document.activeElement).toBe(contentHit)
+    expect(contentHit.getAttribute('aria-selected')).toBe('true')
+  })
+
+  it('appends indistinguishable content hits without duplicate React keys', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        results: [{ ...RESULT, resultId: 'message:item-1' }],
+        nextCursor: 'page-2',
+      })
+      .mockResolvedValueOnce({
+        results: [{ ...RESULT, resultId: 'message:item-2' }],
+        nextCursor: null,
+      })
+    render(
+      <SessionSearch
+        transport={new TestTransport((method, params) => request(method, params))}
+        projects={[]}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Search every chat'), {
+      target: { value: 'regression' },
+    })
+    expect(await screen.findAllByRole('option', { name: /Fix regression/ })).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+
+    await waitFor(() => {
+      expect(screen.getAllByRole('option', { name: /Fix regression/ })).toHaveLength(2)
+    })
+    expect(consoleError.mock.calls.flat().join(' ')).not.toContain('same key')
+  })
+
+  it('retains title and content row instances across equivalent rerenders', async () => {
+    const transport = new TestTransport(async () => ({
+      results: [{ ...RESULT, resultId: 'message:item-1' }],
+      nextCursor: null,
+    }))
+    const view = render(
+      <SessionSearch
+        transport={transport}
+        projects={PROJECTS}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Search every chat'), {
+      target: { value: 'regression' },
+    })
+    const titleHit = screen.getByRole('option', { name: /Regression planning/ })
+    const contentHit = await screen.findByRole('option', { name: /Fix regression/ })
+
+    view.rerender(
+      <SessionSearch
+        transport={transport}
+        projects={PROJECTS.map((project) => ({
+          ...project,
+          sessions: project.sessions.map((session) => ({ ...session })),
+        }))}
+        onSelect={() => undefined}
+        onClose={() => undefined}
+      />,
+    )
+
+    expect(screen.getByRole('option', { name: /Regression planning/ })).toBe(titleHit)
+    expect(screen.getByRole('option', { name: /Fix regression/ })).toBe(contentHit)
+  })
+
+  it('keeps duplicate legacy results usable when resultId is omitted', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const onSelect = vi.fn()
+    const transport = new TestTransport(async () => ({
+      results: [RESULT, { ...RESULT }],
+      nextCursor: null,
+    }))
+    const view = render(
+      <SessionSearch
+        transport={transport}
+        projects={[]}
+        onSelect={onSelect}
+        onClose={() => undefined}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Search every chat'), {
+      target: { value: 'regression' },
+    })
+    const legacyHits = await screen.findAllByRole('option', { name: /Fix regression/ })
+
+    fireEvent.click(legacyHits[0]!)
+    fireEvent.click(legacyHits[1]!)
+    expect(onSelect).toHaveBeenCalledTimes(2)
+    expect(consoleError.mock.calls.flat().join(' ')).not.toContain('same key')
+
+    view.rerender(
+      <SessionSearch
+        transport={transport}
+        projects={[{ path: 'D:\\other', name: 'Other', sessions: [] }]}
+        onSelect={onSelect}
+        onClose={() => undefined}
+      />,
+    )
+    const rerenderedHits = screen.getAllByRole('option', { name: /Fix regression/ })
+    expect(rerenderedHits[0]).toBe(legacyHits[0])
+    expect(rerenderedHits[1]).toBe(legacyHits[1])
+  })
+})

@@ -1,0 +1,322 @@
+import { describe, expect, it } from 'vitest'
+import { ClaudeEventSchema, toDomainEvents, toUsage, type ClaudeEvent } from './events.js'
+
+/**
+ * Fixtures captured from claude-code 2.1.220's actual output.
+ *
+ * This adapter reads a shape we do not control and no generator exists for, so
+ * the tests are the contract. When the CLI changes, these are what tell us.
+ */
+
+describe('claude event translation', () => {
+  it('turns an assistant text block into a message', () => {
+    const events = toDomainEvents(
+      {
+        type: 'assistant',
+        message: { id: 'msg_1', role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
+      },
+      't1',
+    )
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      type: 'item.completed',
+      item: { type: 'message', role: 'assistant', text: 'hi' },
+    })
+  })
+
+  it('splits a message carrying text and a tool call into separate items', () => {
+    // Claude Code batches where Codex streams: one envelope, several things.
+    const events = toDomainEvents(
+      {
+        type: 'assistant',
+        message: {
+          id: 'msg_2',
+          content: [
+            { type: 'text', text: 'Checking.' },
+            { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'node -v' } },
+          ],
+        },
+      },
+      't1',
+    )
+    expect(events).toHaveLength(2)
+    expect(events[1]).toMatchObject({ item: { type: 'command', command: 'node -v' } })
+  })
+
+  it('keeps item identities unique when separate blocks reuse a message id', () => {
+    // Captured from claude-code 2.1.222: it reused one message id for a
+    // narration envelope and a later tool-use envelope, both at block index 0.
+    const captured: ClaudeEvent[] = [
+      {
+        type: 'assistant',
+        message: {
+          id: 'msg_011CdwAM63bijViHvHrHysNR',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'I will inspect the fixture.' }],
+        },
+      },
+      {
+        type: 'assistant',
+        message: {
+          id: 'msg_011CdwAM63bijViHvHrHysNR',
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_018pJWfDcup4YmC285NtuAb5',
+              name: 'Read',
+              input: { file_path: 'inspection.txt' },
+            },
+          ],
+        },
+      },
+    ]
+
+    const translate = () => captured.flatMap((event) => toDomainEvents(event, 't1'))
+    const first = translate()
+    const replay = translate()
+    const completedItemIds = (events: ReturnType<typeof translate>) =>
+      events.flatMap((event) => (event.type === 'item.completed' ? [event.item.id] : []))
+    const itemIds = completedItemIds(first)
+
+    expect(itemIds).toEqual([
+      'msg_011CdwAM63bijViHvHrHysNR-text-0',
+      'toolu_018pJWfDcup4YmC285NtuAb5-call',
+    ])
+    expect(completedItemIds(replay)).toEqual(itemIds)
+    expect(first).toMatchObject([
+      { type: 'item.completed', item: { type: 'message', text: 'I will inspect the fixture.' } },
+      {
+        type: 'item.completed',
+        item: { type: 'tool_call', text: 'Read\n{"file_path":"inspection.txt"}' },
+      },
+    ])
+  })
+
+  it('reads an edit tool as a file change, not a generic tool call', () => {
+    const events = toDomainEvents(
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: 'src/app.ts' } }],
+        },
+      },
+      't1',
+    )
+    expect(events[0]).toMatchObject({ item: { type: 'file_change', path: 'src/app.ts' } })
+    expect(events[0]).not.toHaveProperty('item.text')
+  })
+
+  it('carries an edit as a unified diff with line counts', () => {
+    const [edit] = toDomainEvents(
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              name: 'Edit',
+              input: { file_path: 'src/app.ts', old_string: 'a\nb', new_string: 'a\nc\nd' },
+            },
+          ],
+        },
+      },
+      't1',
+    )
+    expect(edit).toMatchObject({
+      item: {
+        type: 'file_change',
+        path: 'src/app.ts',
+        linesAdded: 3,
+        linesRemoved: 2,
+        text: [
+          'diff --git a/src/app.ts b/src/app.ts',
+          '--- a/src/app.ts',
+          '+++ b/src/app.ts',
+          '@@ -1,2 +1,3 @@',
+          '-a',
+          '-b',
+          '+a',
+          '+c',
+          '+d',
+        ].join('\n'),
+      },
+    })
+
+    const [write] = toDomainEvents(
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Write', input: { file_path: 'notes.md', content: 'x\n' } },
+          ],
+        },
+      },
+      't1',
+    )
+    expect(write).toMatchObject({
+      item: {
+        type: 'file_change',
+        linesAdded: 1,
+        linesRemoved: 0,
+        text: 'diff --git a/notes.md b/notes.md\n--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1,1 @@\n+x',
+      },
+    })
+  })
+
+  it('lands a tool result on the call that produced it', () => {
+    const tools = new Map()
+    const [started] = toDomainEvents(
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'node --version' } },
+            { type: 'tool_use', id: 'tu2', name: 'WebFetch', input: { url: 'https://x.test' } },
+          ],
+        },
+      },
+      't1',
+      tools,
+    )
+    expect(started).toMatchObject({
+      type: 'item.completed',
+      item: { id: 'tu1-call', type: 'command', status: 'started', command: 'node --version' },
+    })
+
+    const results = toDomainEvents(
+      {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'tu1', content: 'v22' },
+            { type: 'tool_result', tool_use_id: 'tu2', content: 'timed out', is_error: true },
+          ],
+        },
+      },
+      't1',
+      tools,
+    )
+    expect(results).toMatchObject([
+      { item: { id: 'tu1-call', type: 'command', status: 'completed', text: 'v22' } },
+      {
+        item: {
+          id: 'tu2-call',
+          type: 'tool_call',
+          status: 'failed',
+          text: 'WebFetch\n{"url":"https://x.test"}\ntimed out',
+        },
+      },
+    ])
+    expect(tools.size).toBe(0)
+  })
+
+  it('maps thinking blocks to reasoning', () => {
+    const events = toDomainEvents(
+      { type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'hmm' }] } },
+      't1',
+    )
+    expect(events[0]).toMatchObject({ item: { type: 'reasoning', text: 'hmm' } })
+  })
+
+  it('reads a failed tool result as an error rather than output', () => {
+    const events = toDomainEvents(
+      {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'tu1', content: 'not found', is_error: true },
+          ],
+        },
+      },
+      't1',
+    )
+    expect(events[0]).toMatchObject({ item: { type: 'error', text: 'not found' } })
+  })
+
+  it('flattens tool results that arrive as content blocks rather than a string', () => {
+    const events = toDomainEvents(
+      {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'tu1', content: [{ type: 'text', text: 'v22' }] },
+          ],
+        },
+      },
+      't1',
+    )
+    expect(events[0]).toMatchObject({ item: { text: 'v22' } })
+  })
+
+  it('ends the turn on result, and reports failure as failure', () => {
+    expect(toDomainEvents({ type: 'result', is_error: false }, 't1')).toContainEqual({
+      type: 'turn.completed',
+      turnId: 't1',
+      status: 'completed',
+    })
+    expect(toDomainEvents({ type: 'result', is_error: true }, 't1')).toContainEqual({
+      type: 'turn.completed',
+      turnId: 't1',
+      status: 'failed',
+    })
+  })
+
+  it('ignores envelopes it does not understand instead of throwing', () => {
+    // The shape will change. A session must not die because of a new event.
+    expect(toDomainEvents({ type: 'some_future_event' }, 't1')).toEqual([])
+    expect(toDomainEvents({}, 't1')).toEqual([])
+  })
+
+  it('keeps the rest of a message when one block carries an unfamiliar content shape', () => {
+    // Server tools such as web search report their errors as an object rather than the
+    // string or block array a tool_result carries.
+    const parsed = ClaudeEventSchema.safeParse({
+      type: 'assistant',
+      message: {
+        id: 'msg_4',
+        content: [
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' },
+          },
+          { type: 'text', text: 'Search is unavailable, so from memory:' },
+        ],
+      },
+    })
+    expect(parsed.success).toBe(true)
+    expect(toDomainEvents(parsed.data!, 't1')).toMatchObject([
+      { item: { type: 'message', text: 'Search is unavailable, so from memory:' } },
+    ])
+  })
+
+  it('counts cached tokens, which dominate real usage', () => {
+    const usage = toUsage({
+      input_tokens: 2,
+      output_tokens: 4,
+      cache_read_input_tokens: 24787,
+      cache_creation_input_tokens: 9297,
+    })
+    expect(usage).toMatchObject({ cachedInputTokens: 24787, totalTokens: 34090 })
+  })
+
+  it('keeps only cost reported by Claude Code', () => {
+    const events = toDomainEvents(
+      { type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.04 },
+      't1',
+    )
+    expect(events).toContainEqual({
+      type: 'usage.updated',
+      usage: {
+        inputTokens: 2,
+        cachedInputTokens: 0,
+        outputTokens: 3,
+        reasoningTokens: 0,
+        totalTokens: 5,
+        costUsd: 0.04,
+        inputIncludesCached: false,
+      },
+    })
+  })
+})

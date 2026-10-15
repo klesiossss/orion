@@ -1,0 +1,1 @@
+{"version":3,"file":"artifact-store.d.ts","sourceRoot":"","sources":["../src/artifact-store.ts"],"names":[],"mappings":"AAMA,KAAK,YAAY,GAAG,YAAY,GAAG,YAAY,GAAG,WAAW,GAAG,aAAa,GAAG,aAAa,CAAA;AAY7F,wBAAgB,kBAAkB,CAAC,aAAa,EAAE,MAAM,EAAE,IAAI,EAAE,YAAY,GAAG,OAAO,CAMrF;AAED,wBAAgB,mBAAmB,CACjC,aAAa,EAAE,MAAM,EACrB,IAAI,EAAE,YAAY,EAClB,KAAK,EAAE,OAAO,GACb,IAAI,CAaN"}

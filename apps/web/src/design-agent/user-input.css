@@ -1,0 +1,252 @@
+.brief-input {
+  position: absolute;
+  z-index: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  left: 0;
+  width: 100%;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-composer);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  box-shadow: var(--shadow-flyout);
+  transform-origin: center bottom;
+  animation: brief-input-in 220ms var(--ease-out) both;
+}
+
+.composer__box:has(.brief-input) .composer__prompt {
+  border-color: var(--line-strong);
+}
+
+.brief-input__question {
+  padding: 16px 18px 14px;
+}
+
+.brief-input__question h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--t-lg);
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.brief-input__options {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 12px;
+}
+
+.brief-input__option {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--line-strong) 68%, transparent);
+  border-radius: var(--r-xl);
+  background: var(--control-hover);
+  box-shadow: none;
+  color: var(--text-2);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .brief-input__option:hover {
+    border-color: var(--line-strong);
+    background: var(--menu-hover);
+    color: var(--text);
+  }
+}
+
+.brief-input__option:focus-within {
+  border-color: var(--line-strong);
+  background: var(--menu-hover);
+  color: var(--text);
+}
+
+.brief-input__option:has(input:is([type='radio'], [type='checkbox']):checked) {
+  border-color: color-mix(in srgb, var(--text-2) 74%, transparent);
+  background: var(--surface-3);
+  box-shadow: none;
+  color: var(--text);
+}
+
+.brief-input__option input:is([type='radio'], [type='checkbox']) {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  margin: 0;
+  accent-color: var(--text);
+}
+
+.brief-input__option > span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--t-sm);
+  font-weight: 530;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brief-input__option--custom {
+  position: relative;
+  padding: 4px 4px 4px 10px;
+  cursor: text;
+}
+
+.brief-input__custom,
+.brief-input__option > .brief-input__custom-preview {
+  min-width: 0;
+  flex: 1;
+  min-height: 32px;
+  padding: 5px 8px;
+  line-height: 16px;
+}
+
+.brief-input__custom {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+}
+
+.brief-input__custom:focus-visible {
+  outline: 0;
+}
+
+.brief-input__option--custom:has(.brief-input__custom:focus-visible) {
+  border-color: var(--text-2);
+}
+
+.brief-input__option > .brief-input__custom-preview {
+  border: 1px solid var(--line);
+  border-radius: calc(var(--r-xl) - 2px);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  box-shadow: none;
+  color: var(--text-3);
+  font-weight: 450;
+}
+
+.brief-input__custom::placeholder {
+  color: var(--text-3);
+}
+
+.brief-input__footer {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 9px 7px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.brief-input__footer > span {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.brief-input__actions {
+  display: flex;
+  gap: 6px;
+}
+
+.brief-input__actions button {
+  min-width: 58px;
+  min-height: 32px;
+  padding: 6px 11px;
+  border: 1px solid color-mix(in srgb, var(--line-strong) 70%, transparent);
+  border-radius: var(--r-xl);
+  background: var(--control-hover);
+  box-shadow: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 570;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    opacity var(--dur-fast) var(--ease-out);
+}
+
+.brief-input__next:not(:disabled) {
+  border-color: color-mix(in srgb, white 54%, var(--line-strong));
+  background: var(--light);
+  box-shadow: none;
+  color: var(--on-light);
+}
+
+.brief-input__next:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.brief-input--status {
+  display: flex;
+  width: fit-content;
+  min-height: 36px;
+  align-items: center;
+  gap: 9px;
+  right: auto;
+  bottom: calc(100% + 6px);
+  left: 0;
+  padding: 0 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  color: var(--text-2);
+  font-size: var(--t-sm);
+}
+
+.brief-input__spinner {
+  width: 14px;
+  height: 14px;
+  color: var(--text);
+  animation: brief-spin 700ms linear infinite;
+}
+
+/* The working rail's own label already names the design phase; replacing the
+   timer with a second copy of it was a relic from when the rail only knew
+   "Working". */
+.shell:has(.composer__design.is-active) .aux--reasoning.aux--live,
+.stage__body:has(.brief-input) .activity--working {
+  display: none;
+}
+
+@keyframes brief-input-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+}
+
+@keyframes brief-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brief-input,
+  .brief-input__spinner {
+    animation: none;
+  }
+
+  .brief-input__option,
+  .brief-input__actions button {
+    transition: none;
+  }
+}

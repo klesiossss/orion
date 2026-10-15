@@ -1,0 +1,1487 @@
+import { describe, expect, it } from 'vitest'
+import { DomainEventSchema, ItemSchema } from './domain.js'
+import {
+  channels,
+  DiffFileSchema,
+  ErrorCode,
+  McpCapabilitiesSchema,
+  McpServerConfigSchema,
+  McpServerSchema,
+  McpStartupStatusSchema,
+  methods,
+  PreviewCaptureRequestSchema,
+  PreviewCaptureResultSchema,
+  PushSchema,
+  RequestSchema,
+  ResponseSchema,
+  SessionSearchResultSchema,
+  SidebarSettingsSchema,
+  SkillCapabilitiesSchema,
+  SkillSchema,
+  ThreadLifecycleSchema,
+  type ProviderLimit,
+  type ProviderLimitSource,
+} from './protocol.js'
+
+describe('audit recovery contracts', () => {
+  it('preserves a named base branch and rejects empty or excessive refs', () => {
+    const start = {
+      provider: 'codex',
+      workspacePath: '/repo',
+      isolate: true,
+      baseRef: 'feature/example',
+    }
+    expect(methods['thread.start'].params.parse(start)).toMatchObject(start)
+    expect(methods['thread.start'].params.safeParse({ ...start, baseRef: '' }).success).toBe(false)
+    expect(
+      methods['thread.start'].params.safeParse({ ...start, baseRef: 'x'.repeat(1025) }).success,
+    ).toBe(false)
+  })
+
+  it('requires valid offsets for recovered terminal results and accepts legacy output', () => {
+    const terminalId = '217b92e8-4a22-4ee7-901f-76a336efb32e'
+    const result = { status: 'exited', output: 'done', outputOffset: 200004, exitCode: 0 }
+    expect(methods['terminal.status'].result.parse(result)).toEqual(result)
+    expect(
+      methods['terminal.status'].result.safeParse({ ...result, outputOffset: -1 }).success,
+    ).toBe(false)
+    expect(channels['terminal.output'].parse({ terminalId, data: 'legacy' })).toEqual({
+      terminalId,
+      data: 'legacy',
+    })
+    expect(
+      channels['terminal.output'].safeParse({ terminalId, data: 'bad', outputOffset: 0.5 }).success,
+    ).toBe(false)
+  })
+
+  it('validates capture cancellation and bounded provider-watch targets', () => {
+    const requestId = '217b92e8-4a22-4ee7-901f-76a336efb32e'
+    expect(channels['preview.captureCancelled'].parse({ requestId })).toEqual({ requestId })
+    expect(
+      methods['providers.watch'].params.parse({
+        provider: 'grok',
+        projectPath: '/repo',
+        targets: ['mcp', 'skills'],
+      }),
+    ).toMatchObject({ provider: 'grok' })
+    expect(
+      methods['providers.watch'].params.safeParse({
+        provider: 'codex',
+        projectPath: '/repo',
+        targets: ['mcp', 'skills', 'mcp'],
+      }).success,
+    ).toBe(false)
+  })
+})
+
+describe('domain events', () => {
+  it('accepts a streaming delta', () => {
+    const event = {
+      type: 'item.delta',
+      turnId: 't1',
+      itemId: 'i1',
+      textDelta: 'hello',
+    }
+    expect(DomainEventSchema.parse(event)).toEqual(event)
+  })
+
+  it('carries a durable turn completion boundary without rejecting legacy history', () => {
+    const completed = {
+      type: 'turn.completed',
+      turnId: 't1',
+      status: 'completed',
+      completedAt: 32_000,
+    }
+
+    expect(DomainEventSchema.parse(completed)).toEqual(completed)
+    expect(
+      DomainEventSchema.parse({ type: 'turn.completed', turnId: 'legacy', status: 'completed' }),
+    ).toEqual({ type: 'turn.completed', turnId: 'legacy', status: 'completed' })
+  })
+
+  it('rejects an event with an unknown type instead of passing it through', () => {
+    // Silently accepting unknown events is how a client and server drift apart
+    // without anyone noticing. Adapters must map to `unknown` explicitly.
+    expect(() => DomainEventSchema.parse({ type: 'item.exploded' })).toThrow()
+  })
+
+  it('keeps unrecognised adapter output as an unknown item rather than dropping it', () => {
+    const item = ItemSchema.parse({
+      id: 'i1',
+      turnId: 't1',
+      type: 'unknown',
+      status: 'completed',
+      text: 'some shape we did not expect',
+      createdAt: Date.now(),
+    })
+    expect(item.type).toBe('unknown')
+  })
+
+  it('preserves assistant phases without rejecting legacy items', () => {
+    const legacy = {
+      id: 'i1',
+      turnId: 't1',
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      text: 'Done.',
+      createdAt: 1,
+    }
+
+    expect(ItemSchema.parse(legacy)).toEqual(legacy)
+    expect(ItemSchema.parse({ ...legacy, phase: 'commentary' }).phase).toBe('commentary')
+    expect(ItemSchema.parse({ ...legacy, phase: 'final_answer' }).phase).toBe('final_answer')
+    expect(() => ItemSchema.parse({ ...legacy, phase: 'analysis' })).toThrow()
+  })
+
+  it('preserves attachments on user messages without changing legacy messages', () => {
+    const message = {
+      id: 'i1',
+      turnId: 't1',
+      type: 'message',
+      status: 'completed',
+      role: 'user',
+      text: 'Review this',
+      createdAt: 1,
+    }
+
+    expect(ItemSchema.parse(message)).toEqual(message)
+    expect(
+      ItemSchema.parse({ ...message, attachments: ['/work/reference.png'] }).attachments,
+    ).toEqual(['/work/reference.png'])
+  })
+
+  it('carries one item ID through a complete lifecycle', () => {
+    const item = {
+      id: 'assistant-1',
+      turnId: 't1',
+      type: 'message',
+      status: 'started',
+      role: 'assistant',
+      createdAt: 1,
+    }
+    const events = [
+      DomainEventSchema.parse({ type: 'item.started', item }),
+      DomainEventSchema.parse({
+        type: 'item.delta',
+        turnId: item.turnId,
+        itemId: item.id,
+        textDelta: 'Done.',
+      }),
+      DomainEventSchema.parse({
+        type: 'item.completed',
+        item: { ...item, status: 'completed', text: 'Done.' },
+      }),
+    ]
+
+    expect(events.map((event) => ('item' in event ? event.item.id : event.itemId))).toEqual([
+      item.id,
+      item.id,
+      item.id,
+    ])
+  })
+
+  it('accepts automatic approval review progress and results', () => {
+    const review = {
+      id: 'review-1',
+      turnId: 'turn-1',
+      status: 'approved' as const,
+      description: 'Run npm test',
+      rationale: 'The command only runs the local test suite.',
+      riskLevel: 'low' as const,
+      startedAt: 10,
+      completedAt: 20,
+    }
+
+    expect(DomainEventSchema.parse({ type: 'approval.review.completed', review })).toEqual({
+      type: 'approval.review.completed',
+      review,
+    })
+  })
+
+  it('accepts structured user-input requests', () => {
+    const request = {
+      id: 'brief-questions-1',
+      turnId: 'turn-1',
+      questions: [
+        {
+          id: 'palette',
+          header: 'Colour',
+          question: 'Do you already have a palette?',
+          allowOther: true,
+          secret: false,
+          options: [
+            { label: 'Decide for me', description: 'Choose from the inferred direction.' },
+            { label: 'I have colours', description: 'Add the colours as a custom answer.' },
+          ],
+        },
+      ],
+      autoResolutionMs: null,
+      createdAt: 10,
+    }
+
+    expect(DomainEventSchema.parse({ type: 'user_input.requested', request })).toEqual({
+      type: 'user_input.requested',
+      request,
+    })
+    expect(DomainEventSchema.parse({ type: 'user_input.resolved', id: request.id })).toEqual({
+      type: 'user_input.resolved',
+      id: request.id,
+    })
+  })
+})
+
+describe('protocol envelopes', () => {
+  it('validates a request envelope', () => {
+    expect(RequestSchema.parse({ id: '1', method: 'system.info', params: {} })).toBeTruthy()
+  })
+
+  it('requires a sequence on every push so clients can detect gaps', () => {
+    expect(() => PushSchema.parse({ channel: 'server.welcome', data: {} })).toThrow()
+  })
+
+  it('bounds desktop preview capture at the protocol boundary', () => {
+    const request = {
+      requestId: '0dca4330-66f5-4f68-9287-c6b2bf4c6bf0',
+      url: 'http://127.0.0.1:5183/',
+      viewports: [{ width: 1_440, height: 900 }],
+    }
+
+    expect(PreviewCaptureRequestSchema.parse(request)).toEqual(request)
+    expect(() =>
+      PreviewCaptureRequestSchema.parse({ ...request, url: 'https://example.com' }),
+    ).toThrow()
+    expect(() =>
+      PreviewCaptureRequestSchema.parse({
+        ...request,
+        viewports: [{ width: 10_000, height: 900 }],
+      }),
+    ).toThrow()
+    const legacyResult = {
+      status: 'completed' as const,
+      requestId: request.requestId,
+      screenshots: [{ path: 'C:\\tmp\\desktop.png', width: 1_440, height: 900 }],
+    }
+    expect(PreviewCaptureResultSchema.parse(legacyResult)).toEqual(legacyResult)
+
+    const auditedResult = {
+      ...legacyResult,
+      screenshots: [
+        {
+          path: 'C:\\tmp\\mobile.png',
+          width: 390,
+          height: 844,
+          domAudit: {
+            h1Count: 0,
+            interactiveTargetViolations: [
+              { selector: '#theme', label: 'Theme', width: 32.5, height: 32 },
+              { selector: 'a:nth-of-type(2)', label: '', width: 80, height: 20 },
+            ],
+          },
+        },
+      ],
+    }
+    expect(PreviewCaptureResultSchema.parse(auditedResult)).toEqual(auditedResult)
+    expect(() =>
+      PreviewCaptureResultSchema.parse({
+        ...auditedResult,
+        screenshots: [
+          {
+            ...auditedResult.screenshots[0],
+            domAudit: {
+              h1Count: 1,
+              interactiveTargetViolations: [
+                { selector: '#large', label: 'Large control', width: 44, height: 44 },
+              ],
+            },
+          },
+        ],
+      }),
+    ).toThrow()
+  })
+
+  it('validates params for every declared method', () => {
+    expect(
+      methods['thread.start'].params.parse({
+        provider: 'codex',
+        workspacePath: 'D:\\x',
+        serviceTier: 'priority',
+        approval: 'auto-review',
+      }),
+    ).toBeTruthy()
+    expect(
+      methods['thread.sendTurn'].params.parse({
+        threadId: 'th1',
+        text: 'hello',
+        clientSubmissionId: 'submission-1',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+        serviceTier: 'priority',
+      }),
+    ).toMatchObject({ clientSubmissionId: 'submission-1' })
+    expect(
+      methods['thread.sendTurn'].params.parse({
+        threadId: 'legacy-thread',
+        text: 'legacy client',
+      }),
+    ).toEqual({ threadId: 'legacy-thread', text: 'legacy client' })
+    expect(() =>
+      methods['thread.sendTurn'].params.parse({
+        threadId: 'th1',
+        text: 'hello',
+        clientSubmissionId: '',
+      }),
+    ).toThrow()
+    expect(() =>
+      methods['thread.sendTurn'].params.parse({
+        threadId: 'th1',
+        text: 'hello',
+        clientSubmissionId: 'x'.repeat(257),
+      }),
+    ).toThrow()
+    expect(
+      methods['thread.sendTurn'].result.parse({
+        queued: true,
+        queuedTurn: {
+          id: 'queued-1',
+          text: 'Do this next',
+          attachments: ['D:\\x\\reference.png'],
+          createdAt: 10,
+        },
+      }),
+    ).toBeTruthy()
+    expect(
+      methods['thread.setApproval'].params.parse({ threadId: 'th1', approval: 'full' }),
+    ).toEqual({ threadId: 'th1', approval: 'full' })
+    expect(methods['thread.queue'].result.parse({ items: [], canSteer: true })).toEqual({
+      items: [],
+      canSteer: true,
+    })
+    expect(
+      methods['thread.respondToUserInput'].params.parse({
+        threadId: 'th1',
+        requestId: 'brief-questions-1',
+        answers: { palette: ['Decide for me'] },
+      }),
+    ).toEqual({
+      threadId: 'th1',
+      requestId: 'brief-questions-1',
+      answers: { palette: ['Decide for me'] },
+    })
+    expect(() =>
+      methods['thread.respondToUserInput'].params.parse({
+        threadId: 'th1',
+        requestId: 'brief-questions-1',
+        answers: { palette: [] },
+      }),
+    ).toThrow()
+    expect(() => methods['thread.start'].params.parse({ provider: 'nope' })).toThrow()
+    expect(methods['models.list'].params.parse({ provider: 'codex', agent: 'codex-fork' })).toEqual(
+      {
+        provider: 'codex',
+        agent: 'codex-fork',
+      },
+    )
+    expect(
+      methods['harnesses.upsert'].params.parse({
+        id: 'codex-fork',
+        displayName: 'Codex Fork',
+        provider: 'codex',
+        command: '/Applications/Codex forks/codex-fork',
+        args: ['--profile', 'value with spaces'],
+        workingDirectory: '~/Developer/codex-fork',
+        environment: { CODEX_HOME: '/Users/me/.codex-fork' },
+      }),
+    ).toMatchObject({
+      provider: 'codex',
+      args: ['--profile', 'value with spaces'],
+      workingDirectory: '~/Developer/codex-fork',
+      environment: { CODEX_HOME: '/Users/me/.codex-fork' },
+    })
+    expect(
+      methods['harnesses.verify'].result.parse({
+        verification: {
+          status: 'ready',
+          summary: 'Codex Fork is compatible',
+          checkedAt: 1,
+          resolvedCommand: '/Users/me/.local/bin/codex-fork',
+          checks: [
+            {
+              label: 'Codex app-server',
+              status: 'passed',
+              detail: 'Initialize handshake completed.',
+            },
+          ],
+        },
+      }),
+    ).toMatchObject({ verification: { status: 'ready' } })
+    expect(() =>
+      methods['harnesses.upsert'].params.parse({
+        id: 'bad',
+        displayName: 'Bad',
+        provider: 'unlisted-cli',
+        command: 'bad',
+        args: [],
+      }),
+    ).toThrow()
+    expect(() => methods['models.list'].params.parse({ provider: 'codex', agent: '' })).toThrow()
+    expect(methods['auth.status'].params.parse({ provider: 'codex', agent: 'codex-fork' })).toEqual(
+      {
+        provider: 'codex',
+        agent: 'codex-fork',
+      },
+    )
+    expect(methods['auth.startLogin'].result.parse({ loginId: 'cli-login' })).toEqual({
+      loginId: 'cli-login',
+    })
+    expect(() => methods['auth.status'].params.parse({ provider: 'codex', agent: '' })).toThrow()
+    expect(() => methods['auth.startLogin'].result.parse({ loginId: '' })).toThrow()
+    const { undo } = methods['thread.restore'].result.parse({ undo: 'restore-token' })
+    expect(methods['thread.undoRestore'].params.parse({ threadId: 'th1', undo })).toEqual({
+      threadId: 'th1',
+      undo,
+    })
+    expect(() => methods['thread.restore'].result.parse({ undo: '' })).toThrow()
+    const projects = methods['projects.list'].result.parse({
+      projects: [
+        {
+          path: 'D:\\x',
+          name: 'x',
+          pinned: false,
+          createdAt: 0,
+          sessions: [
+            {
+              id: 'th1',
+              title: 'Isolated',
+              provider: 'codex',
+              createdAt: 0,
+              running: true,
+              pinned: true,
+              worktreeBranch: 'harness/th1',
+            },
+          ],
+        },
+      ],
+    })
+    expect(projects.projects[0]?.sessions[0]?.worktreeBranch).toBe('harness/th1')
+    expect(projects.projects[0]?.sessions[0]?.pinned).toBe(true)
+    expect(methods['thread.pin'].params.parse({ threadId: 'th1', pinned: true })).toEqual({
+      threadId: 'th1',
+      pinned: true,
+    })
+    expect(
+      methods['workspace.switchBranch'].params.parse({ path: 'D:\\x', branch: 'feature/shelf' }),
+    ).toEqual({ path: 'D:\\x', branch: 'feature/shelf' })
+  })
+
+  it('reports every panic-stop target as interrupted or failed', () => {
+    const result = methods['system.panicStop'].result.parse({
+      sessions: [
+        { threadId: 'thread-1', status: 'interrupted' },
+        { threadId: 'thread-2', status: 'failed', error: 'Adapter did not respond' },
+      ],
+    })
+
+    expect(result.sessions).toHaveLength(2)
+    expect(() =>
+      methods['system.panicStop'].result.parse({
+        sessions: [{ threadId: 'thread-2', status: 'failed' }],
+      }),
+    ).toThrow()
+  })
+
+  it('defines a platform-neutral terminal stream', () => {
+    const opened = methods['terminal.open'].params.parse({
+      threadId: 'thread-1',
+      columns: 120,
+      rows: 40,
+    })
+    expect(opened).toEqual({ threadId: 'thread-1', columns: 120, rows: 40 })
+    expect(
+      methods['terminal.open'].params.parse({
+        projectPath: '/workspace',
+        columns: 100,
+        rows: 30,
+      }),
+    ).toEqual({ projectPath: '/workspace', columns: 100, rows: 30 })
+    expect(() =>
+      methods['terminal.open'].params.parse({
+        threadId: 'thread-1',
+        projectPath: '/workspace',
+        columns: 100,
+        rows: 30,
+      }),
+    ).toThrow()
+
+    const { terminalId } = methods['terminal.open'].result.parse({ terminalId: 'terminal-1' })
+    expect(methods['terminal.input'].params.parse({ terminalId, data: '\u0003' })).toEqual({
+      terminalId,
+      data: '\u0003',
+    })
+    expect(methods['terminal.resize'].params.parse({ terminalId, columns: 80, rows: 24 })).toEqual({
+      terminalId,
+      columns: 80,
+      rows: 24,
+    })
+    expect(methods['terminal.close'].params.parse({ terminalId })).toEqual({ terminalId })
+
+    expect(channels['terminal.output'].parse({ terminalId, data: 'ready\r\n' })).toEqual({
+      terminalId,
+      data: 'ready\r\n',
+    })
+    expect(channels['terminal.exit'].parse({ terminalId, exitCode: 0 })).toEqual({
+      terminalId,
+      exitCode: 0,
+    })
+    expect(channels['terminal.exit'].parse({ terminalId, exitCode: null }).exitCode).toBeNull()
+    expect(() =>
+      methods['terminal.resize'].params.parse({ terminalId, columns: 0, rows: 24 }),
+    ).toThrow()
+  })
+
+  it('keeps unreported usage cost absent', () => {
+    expect(methods['usage.summary'].params.parse({ provider: 'codex' })).toEqual({
+      provider: 'codex',
+    })
+    expect(() => methods['usage.summary'].params.parse({})).toThrow()
+
+    const result = methods['usage.summary'].result.parse({
+      session: {
+        inputTokens: 10,
+        cachedInputTokens: 2,
+        outputTokens: 3,
+        reasoningTokens: 1,
+        totalTokens: 16,
+      },
+      today: {
+        inputTokens: 10,
+        cachedInputTokens: 2,
+        outputTokens: 3,
+        reasoningTokens: 1,
+        totalTokens: 16,
+        costUsd: 0.04,
+      },
+      limits: [{ label: '5 hours', usedPercent: 25, resetsAt: 1_800_000 }],
+      limitSource: {
+        provider: 'codex',
+        status: 'ready',
+        limits: [{ label: '5 hours', usedPercent: 25, resetsAt: 1_800_000 }],
+      },
+    })
+
+    expect(result.session.costUsd).toBeUndefined()
+    expect(result.today.costUsd).toBe(0.04)
+    expect(result.limits[0]?.usedPercent).toBe(25)
+    expect(result.limitSource).toEqual({
+      provider: 'codex',
+      status: 'ready',
+      limits: [{ label: '5 hours', usedPercent: 25, resetsAt: 1_800_000 }],
+    })
+    expect(channels['usage.changed'].parse({ provider: 'codex' })).toEqual({
+      provider: 'codex',
+    })
+  })
+
+  it('accepts a consume-reset limit action and a UUID redemption attempt', () => {
+    const usage = {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+    }
+    const limit = {
+      label: 'Rate limit resets',
+      usedPercent: 0,
+      valueLabel: '1 available',
+      action: 'consume-reset' as const,
+      resetCredits: [{ id: 'reset-fixture', expiresAt: 1_791_173_958_000 }, { expiresAt: null }],
+    }
+    expect(
+      methods['usage.summary'].result.parse({
+        session: usage,
+        today: usage,
+        limits: [limit],
+        limitSource: { provider: 'codex', status: 'ready', limits: [limit] },
+      }).limits[0],
+    ).toEqual(limit)
+    expect(() =>
+      methods['usage.summary'].result.parse({
+        session: usage,
+        today: usage,
+        limits: [{ label: 'Rate limit resets', usedPercent: 0, valueLabel: '1', action: 'refund' }],
+        limitSource: {
+          provider: 'codex',
+          status: 'ready',
+          limits: [
+            { label: 'Rate limit resets', usedPercent: 0, valueLabel: '1', action: 'refund' },
+          ],
+        },
+      }),
+    ).toThrow()
+
+    const key = '8ae96ff3-3425-4f4c-8772-b6fd61502868'
+    const selected = { provider: 'codex', idempotencyKey: key, creditId: 'reset-fixture' }
+    expect(methods['usage.consumeReset'].params.parse(selected)).toEqual(selected)
+    expect(() =>
+      methods['usage.consumeReset'].params.parse({ ...selected, creditId: '' }),
+    ).toThrow()
+    expect(
+      methods['usage.consumeReset'].params.parse({ provider: 'codex', idempotencyKey: key }),
+    ).toEqual({
+      provider: 'codex',
+      idempotencyKey: key,
+    })
+    expect(() =>
+      methods['usage.consumeReset'].params.parse({ provider: 'codex', idempotencyKey: 'retry-1' }),
+    ).toThrow()
+    expect(methods['usage.consumeReset'].result.parse({ outcome: 'reset' })).toEqual({
+      outcome: 'reset',
+    })
+    expect(() => methods['usage.consumeReset'].result.parse({ outcome: 'ok' })).toThrow()
+  })
+
+  it('keeps one authoritative provider limit source with a legacy fallback', () => {
+    const usage = {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+    }
+    const parse = (limits: ProviderLimit[], limitSource?: ProviderLimitSource) =>
+      methods['usage.summary'].result.parse({
+        session: usage,
+        today: usage,
+        limits,
+        ...(!(limitSource === undefined) ? { limitSource } : {}),
+      })
+
+    expect(parse([]).limitSource).toBeUndefined()
+    expect(parse([], { provider: 'grok', status: 'ready', limits: [] }).limitSource).toEqual({
+      provider: 'grok',
+      status: 'ready',
+      limits: [],
+    })
+    expect(parse([], { provider: 'codex', status: 'unavailable' }).limitSource).toEqual({
+      provider: 'codex',
+      status: 'unavailable',
+    })
+
+    expect(() =>
+      parse([{ label: 'Weekly', usedPercent: 10 }], {
+        provider: 'grok',
+        status: 'unavailable',
+      }),
+    ).toThrow()
+    expect(() =>
+      parse([], {
+        provider: 'grok',
+        status: 'ready',
+        limits: [{ label: 'Weekly', usedPercent: 10 }],
+      }),
+    ).toThrow()
+    expect(() => parse([], { provider: 'unknown', status: 'unavailable' })).toThrow()
+    expect(() => parse([], { provider: 'grok', status: 'stale' })).toThrow()
+  })
+
+  it('proves each provider limit field boundary independently', () => {
+    const usage = {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+    }
+    const baseline = { label: 'L', usedPercent: 50, resetsAt: 1, valueLabel: 'V' }
+    const parse = (overrides: Partial<typeof baseline>) => {
+      const limit = { ...baseline, ...overrides }
+      return methods['usage.summary'].result.parse({
+        session: usage,
+        today: usage,
+        limits: [limit],
+        limitSource: { provider: 'grok', status: 'ready', limits: [limit] },
+      })
+    }
+
+    const valid: Array<[string, Partial<typeof baseline>]> = [
+      ['label minimum', { label: 'x' }],
+      ['label maximum', { label: 'x'.repeat(120) }],
+      ['value label minimum', { valueLabel: 'x' }],
+      ['value label maximum', { valueLabel: 'x'.repeat(160) }],
+      ['percent minimum', { usedPercent: 0 }],
+      ['percent maximum', { usedPercent: 100 }],
+      ['reset minimum', { resetsAt: 0 }],
+      ['reset maximum safe integer', { resetsAt: Number.MAX_SAFE_INTEGER }],
+    ]
+    for (const [boundary, override] of valid) {
+      expect(parse(override), boundary).toBeDefined()
+    }
+
+    const invalid: Array<[string, Partial<typeof baseline>]> = [
+      ['label below minimum', { label: '' }],
+      ['label above maximum', { label: 'x'.repeat(121) }],
+      ['value label below minimum', { valueLabel: '' }],
+      ['value label above maximum', { valueLabel: 'x'.repeat(161) }],
+      ['percent below minimum', { usedPercent: -0.01 }],
+      ['percent above maximum', { usedPercent: 100.01 }],
+      ['reset below minimum', { resetsAt: -1 }],
+      ['reset non-integer', { resetsAt: 0.5 }],
+      ['reset above maximum safe integer', { resetsAt: Number.MAX_SAFE_INTEGER + 1 }],
+    ]
+    for (const [boundary, override] of invalid) {
+      expect(() => parse(override), boundary).toThrow()
+    }
+  })
+
+  it('validates versioned diff review and stale snapshot errors', () => {
+    const diff = {
+      threadId: 'thread-1',
+      version: 'snapshot-1',
+      files: [
+        {
+          path: 'src/index.ts',
+          status: 'modified' as const,
+          binary: false,
+          hunks: [
+            {
+              id: 'hunk-1',
+              header: '@@ -1 +1 @@',
+              oldStart: 1,
+              oldLines: 1,
+              newStart: 1,
+              newLines: 1,
+              lines: [
+                { kind: 'deletion' as const, oldLine: 1, text: 'old', noNewlineAtEnd: true },
+                { kind: 'addition' as const, newLine: 1, text: 'new' },
+              ],
+            },
+          ],
+        },
+        {
+          path: 'assets/new-logo.png',
+          previousPath: 'assets/logo.png',
+          status: 'renamed' as const,
+          binary: true,
+          hunks: [],
+        },
+      ],
+    }
+
+    expect(methods['thread.diff'].result.parse(diff)).toEqual(diff)
+    expect(
+      methods['workspace.diff'].params.parse({
+        projectPath: '/repo',
+        threadId: 'thread-1',
+      }),
+    ).toEqual({ projectPath: '/repo', threadId: 'thread-1' })
+    expect(methods['workspace.diff'].result.parse(diff)).toEqual(diff)
+    expect(
+      methods['thread.reviewHunk'].params.parse({
+        threadId: 'thread-1',
+        version: 'snapshot-1',
+        path: 'src/index.ts',
+        hunkId: 'hunk-1',
+        decision: 'reject',
+      }).decision,
+    ).toBe('reject')
+    expect(
+      methods['thread.reviewFile'].params.parse({
+        threadId: 'thread-1',
+        version: 'snapshot-1',
+        path: 'assets/new-logo.png',
+        decision: 'accept',
+      }).decision,
+    ).toBe('accept')
+    expect(() =>
+      DiffFileSchema.parse({
+        path: 'asset.bin',
+        status: 'added',
+        binary: true,
+        hunks: diff.files[0]?.hunks,
+      }),
+    ).toThrow()
+    expect(() =>
+      DiffFileSchema.parse({ path: 'new.ts', status: 'renamed', binary: false, hunks: [] }),
+    ).toThrow()
+    expect(() =>
+      DiffFileSchema.parse({
+        path: 'new.ts',
+        previousPath: 'old.ts',
+        status: 'modified',
+        binary: false,
+        hunks: [],
+      }),
+    ).toThrow()
+    expect(
+      ResponseSchema.parse({
+        id: 'request-1',
+        error: { code: ErrorCode.STALE_SNAPSHOT, message: 'Refresh the diff and try again.' },
+      }),
+    ).toMatchObject({ error: { code: 'stale_snapshot' } })
+    expect(() =>
+      ResponseSchema.parse({ id: 'request-2', error: { code: 'typo', message: 'Nope' } }),
+    ).toThrow()
+  })
+
+  it('validates paginated cross-session search', () => {
+    expect(
+      methods['search.sessions'].params.parse({
+        query: ' regression ',
+        projectPath: 'D:\\project',
+        provider: 'codex',
+        cursor: 'current-page',
+        limit: 25,
+      }),
+    ).toEqual({
+      query: 'regression',
+      projectPath: 'D:\\project',
+      provider: 'codex',
+      cursor: 'current-page',
+      limit: 25,
+    })
+    expect(
+      methods['search.sessions'].result.parse({
+        results: [
+          {
+            projectPath: 'D:\\project',
+            projectName: 'project',
+            threadId: 'thread-1',
+            threadTitle: 'Find the regression',
+            turnId: 'turn-2',
+            provider: 'codex',
+            createdAt: 42,
+            snippet: [
+              { text: 'The ', highlighted: false },
+              { text: 'regression', highlighted: true },
+              { text: ' started here.', highlighted: false },
+            ],
+          },
+        ],
+        nextCursor: 'next-page',
+      }).nextCursor,
+    ).toBe('next-page')
+    expect(() => methods['search.sessions'].result.parse({ results: [], nextCursor: '' })).toThrow()
+    expect(() => methods['search.sessions'].params.parse({ query: '   ' })).toThrow()
+    expect(() =>
+      methods['search.sessions'].params.parse({ query: 'regression', limit: 101 }),
+    ).toThrow()
+  })
+
+  it('preserves distinct identities for same-millisecond search results', () => {
+    const shared = {
+      projectPath: 'D:\\project',
+      projectName: 'project',
+      threadId: 'thread-1',
+      threadTitle: 'Find the collision',
+      turnId: 'turn-2',
+      provider: 'codex',
+      createdAt: 42,
+      snippet: [{ text: 'same timestamp', highlighted: true }],
+    }
+    const parsed = methods['search.sessions'].result.parse({
+      results: [
+        { ...shared, resultId: 'event:41' },
+        { ...shared, resultId: 'event:42' },
+      ],
+      nextCursor: null,
+    })
+
+    const legacyKeys = parsed.results.map(
+      (result) => `${result.threadId}:${result.turnId}:${result.createdAt}`,
+    )
+    expect(new Set(legacyKeys).size).toBe(1)
+    expect(parsed.results.map((result) => result.resultId)).toEqual(['event:41', 'event:42'])
+  })
+
+  it('keeps search result identity compatible across staged clients', () => {
+    const result = {
+      projectPath: 'D:\\project',
+      projectName: 'project',
+      threadId: 'thread-1',
+      threadTitle: 'Find the regression',
+      turnId: 'turn-2',
+      provider: 'codex' as const,
+      createdAt: 42,
+      snippet: [{ text: 'regression', highlighted: true }],
+    }
+
+    expect(SessionSearchResultSchema.parse(result)).toEqual(result)
+    expect(
+      SessionSearchResultSchema.omit({ resultId: true }).parse({
+        ...result,
+        resultId: 'event:41',
+      }),
+    ).toEqual(result)
+  })
+
+  it('bounds opaque search result identities', () => {
+    const result = {
+      projectPath: 'D:\\project',
+      projectName: 'project',
+      threadId: 'thread-1',
+      threadTitle: 'Find the regression',
+      turnId: 'turn-2',
+      provider: 'codex' as const,
+      createdAt: 42,
+      snippet: [{ text: 'regression', highlighted: true }],
+    }
+
+    expect(SessionSearchResultSchema.parse({ ...result, resultId: 'x'.repeat(256) }).resultId).toBe(
+      'x'.repeat(256),
+    )
+    expect(() => SessionSearchResultSchema.parse({ ...result, resultId: '' })).toThrow()
+    expect(() =>
+      SessionSearchResultSchema.parse({ ...result, resultId: 'x'.repeat(257) }),
+    ).toThrow()
+  })
+
+  it('validates the persisted inbox lifecycle without conflating archive state', () => {
+    const settled = methods['thread.settle'].result.parse({
+      lifecycle: { state: 'settled', settledAt: 20, reason: 'manual' },
+    })
+    expect(settled.lifecycle.state).toBe('settled')
+    expect(methods['thread.snooze'].params.parse({ threadId: 'thread-1', wakeAt: 60_000 })).toEqual(
+      { threadId: 'thread-1', wakeAt: 60_000 },
+    )
+    expect(ThreadLifecycleSchema.parse({ state: 'active', keepActive: true, wokeAt: 30 })).toEqual({
+      state: 'active',
+      keepActive: true,
+      wokeAt: 30,
+    })
+    expect(SidebarSettingsSchema.parse({ mode: 'inbox', autoSettleDays: null })).toEqual({
+      mode: 'inbox',
+      autoSettleDays: null,
+    })
+    expect(() =>
+      ThreadLifecycleSchema.parse({ state: 'snoozed', snoozedAt: 20, wakeAt: -1 }),
+    ).toThrow()
+    expect(() => SidebarSettingsSchema.parse({ mode: 'inbox', autoSettleDays: 91 })).toThrow()
+  })
+
+  it('validates provider-neutral MCP inventory', () => {
+    const servers = McpServerSchema.array().parse([
+      {
+        id: 'local-files',
+        displayName: 'Local files',
+        scope: 'project',
+        enabled: true,
+        transport: {
+          type: 'stdio',
+          command: 'node',
+          args: ['server.js'],
+          environment: {
+            API_TOKEN: { source: 'credential', credentialRef: 'mcp/local-files/token' },
+          },
+        },
+        auth: { status: 'not_required' },
+        startup: { state: 'ready' },
+        tools: [
+          {
+            name: 'read_file',
+            inputSchema: {
+              type: 'object',
+              properties: { path: { type: 'string' } },
+              required: ['path'],
+            },
+          },
+        ],
+        resources: [{ uri: 'project://readme', name: 'README', mimeType: 'text/markdown' }],
+        resourceTemplates: [
+          {
+            uriTemplate: 'project://files/{path}',
+            name: 'Project file',
+            mimeType: 'text/plain',
+          },
+        ],
+      },
+      {
+        id: 'github',
+        scope: 'global',
+        enabled: true,
+        auth: { status: 'sign_in_required', method: 'oauth' },
+        startup: { state: 'stopped' },
+        tools: [],
+        resources: [],
+        resourceTemplates: [],
+      },
+    ])
+
+    expect(servers[0]?.scope).toBe('project')
+    expect(servers[1]?.transport).toBeUndefined()
+    expect(
+      McpCapabilitiesSchema.parse({
+        inventory: true,
+        add: true,
+        update: true,
+        remove: true,
+        reload: true,
+        startOAuth: true,
+        cancelOAuth: false,
+      }).cancelOAuth,
+    ).toBe(false)
+    expect(
+      McpServerConfigSchema.parse({
+        id: 'remote-docs',
+        enabled: true,
+        transport: {
+          type: 'http',
+          url: 'https://mcp.example.test',
+          headers: {
+            Authorization: {
+              source: 'credential',
+              credentialRef: 'mcp/remote-docs/authorization',
+            },
+          },
+        },
+      }).id,
+    ).toBe('remote-docs')
+    expect(McpServerConfigSchema.parse({ id: 'github', enabled: false })).toEqual({
+      id: 'github',
+      enabled: false,
+    })
+    expect(() => McpServerConfigSchema.parse({ id: 'missing-transport', enabled: true })).toThrow()
+    expect(() =>
+      McpServerConfigSchema.parse({
+        id: 'bad-url',
+        enabled: true,
+        transport: { type: 'http', url: 'ftp://example.test' },
+      }),
+    ).toThrow()
+    expect(() => McpStartupStatusSchema.parse({ state: 'failed', message: '' })).toThrow()
+  })
+
+  it('validates project-scoped MCP management methods', () => {
+    expect(
+      methods['mcp.list'].params.parse({ provider: 'codex', projectPath: 'D:\\project' }),
+    ).toEqual({ provider: 'codex', projectPath: 'D:\\project' })
+    expect(
+      methods['mcp.add'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        server: { id: 'github', enabled: false },
+      }).server,
+    ).toEqual({ id: 'github', enabled: false })
+    expect(
+      methods['mcp.update'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        server: {
+          id: 'remote-docs',
+          enabled: true,
+          transport: { type: 'http', url: 'https://mcp.example.test' },
+        },
+      }).server.id,
+    ).toBe('remote-docs')
+    expect(
+      methods['mcp.remove'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        serverId: 'remote-docs',
+      }).serverId,
+    ).toBe('remote-docs')
+    expect(
+      methods['mcp.reload'].params.parse({ provider: 'codex', projectPath: 'D:\\project' }),
+    ).toBeTruthy()
+
+    const login = methods['mcp.startOAuth'].result.parse({
+      loginId: 'mcp-login-1',
+      authUrl: 'https://auth.example.test/authorize',
+    })
+    expect(
+      methods['mcp.cancelOAuth'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        serverId: 'github',
+        loginId: login.loginId,
+      }).loginId,
+    ).toBe('mcp-login-1')
+    expect(
+      channels['mcp.oauth'].parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        serverId: 'github',
+        loginId: login.loginId,
+        success: true,
+        error: null,
+      }).success,
+    ).toBe(true)
+    expect(
+      channels['mcp.changed'].parse({ provider: 'codex', projectPath: 'D:\\project' }),
+    ).toEqual({ provider: 'codex', projectPath: 'D:\\project' })
+    expect(() =>
+      methods['mcp.startOAuth'].result.parse({
+        loginId: 'mcp-login-2',
+        authUrl: 'file:///tmp/token',
+      }),
+    ).toThrow()
+  })
+
+  it('validates provider-neutral Agent Skills inventory and mutations', () => {
+    const skill = SkillSchema.parse({
+      id: 'project-design',
+      name: 'design-taste',
+      displayName: 'Design taste',
+      description: 'Review interface decisions.',
+      source: { type: 'folder', path: 'D:\\project\\.agents\\skills\\design-taste' },
+      scope: 'project',
+      enabled: true,
+      dependencyErrors: [{ dependency: 'figma', message: 'The Figma connector is not installed.' }],
+      vendorExtension: 'must not cross the contract',
+    })
+
+    expect(skill.source.type).toBe('folder')
+    expect('vendorExtension' in skill).toBe(false)
+    expect(
+      SkillCapabilitiesSchema.parse({ inventory: true, configure: true, install: false }),
+    ).toEqual({ inventory: true, configure: true, install: false })
+
+    expect(
+      methods['skills.list'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+      }),
+    ).toEqual({ provider: 'codex', projectPath: 'D:\\project' })
+    expect(
+      methods['skills.list'].result.parse({
+        capabilities: { inventory: true, configure: true, install: true },
+        skills: [skill],
+        errors: [{ path: 'D:\\broken\\SKILL.md', message: 'Missing frontmatter.' }],
+      }).skills[0]?.name,
+    ).toBe('design-taste')
+    expect(
+      methods['skills.setEnabled'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        skillId: skill.id,
+        enabled: false,
+      }).enabled,
+    ).toBe(false)
+    expect(
+      methods['skills.installFromFolder'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        folderPath: 'D:\\downloads\\my-skill',
+      }).folderPath,
+    ).toBe('D:\\downloads\\my-skill')
+    expect(
+      channels['skills.changed'].parse({ provider: 'codex', projectPath: 'D:\\project' }),
+    ).toEqual({ provider: 'codex', projectPath: 'D:\\project' })
+
+    expect(() => SkillSchema.parse({ ...skill, source: { type: 'folder', path: '' } })).toThrow()
+    expect(() =>
+      methods['skills.setEnabled'].params.parse({
+        provider: 'codex',
+        projectPath: 'D:\\project',
+        skillId: '',
+        enabled: true,
+      }),
+    ).toThrow()
+  })
+
+  it('bounds normalized voice clips at the protocol boundary', () => {
+    const valid = {
+      requestId: '0dca4330-66f5-4f68-9287-c6b2bf4c6bf0',
+      provider: 'codex' as const,
+      audioBase64: 'UklGRg==',
+      mimeType: 'audio/wav' as const,
+      sampleRateHz: 24_000 as const,
+      durationMs: 1_000,
+    }
+
+    expect(methods['voice.transcribe'].params.parse(valid)).toEqual(valid)
+    expect(() =>
+      methods['voice.transcribe'].params.parse({ ...valid, durationMs: 120_001 }),
+    ).toThrow()
+    expect(() =>
+      methods['voice.transcribe'].params.parse({ ...valid, mimeType: 'audio/webm' }),
+    ).toThrow()
+    expect(() =>
+      methods['voice.transcribe'].params.parse({ ...valid, audioBase64: 'not base64!' }),
+    ).toThrow()
+  })
+
+  it('carries actionable provider setup metadata', () => {
+    const setup = {
+      installUrl: 'https://example.test/install',
+      installCommand: 'npm install -g example-cli',
+      login: 'provider' as const,
+    }
+
+    expect(
+      methods['providers.list'].result.parse({
+        providers: [
+          {
+            id: 'grok',
+            displayName: 'Grok',
+            installed: false,
+            auth: 'unknown',
+            setup,
+          },
+        ],
+      }).providers[0]?.setup,
+    ).toEqual(setup)
+  })
+
+  it('names an install target without carrying any command text', () => {
+    const valid = { provider: 'codex', columns: 80, rows: 24 }
+    expect(methods['providers.install'].params.parse(valid)).toEqual(valid)
+    expect(
+      methods['providers.install'].params.parse({ provider: 'grok', columns: 80, rows: 24 }),
+    ).toEqual({ provider: 'grok', columns: 80, rows: 24 })
+    expect(methods['providers.install'].params.parse({ ...valid, command: 'rm -rf /' })).toEqual(
+      valid,
+    )
+    expect(() =>
+      methods['providers.install'].params.parse({
+        provider: 'unlisted-cli',
+        columns: 80,
+        rows: 24,
+      }),
+    ).toThrow()
+    expect(methods['providers.install'].result.parse({ terminalId: 'term-1' })).toEqual({
+      terminalId: 'term-1',
+    })
+  })
+
+  it('keeps update requests limited to a provider and terminal size', () => {
+    const request = { provider: 'codex', columns: 100, rows: 30 }
+    expect(
+      methods['providers.update'].params.parse({
+        ...request,
+        command: 'untrusted command',
+        version: 'untrusted version',
+      }),
+    ).toEqual(request)
+    expect(() =>
+      methods['providers.update'].params.parse({ ...request, provider: 'unlisted-cli' }),
+    ).toThrow()
+    expect(methods['providers.updates'].params.parse({ refresh: true })).toEqual({ refresh: true })
+  })
+
+  it('names a launch target without carrying any command text', () => {
+    const valid = { provider: 'codex', columns: 80, rows: 24 }
+    expect(methods['providers.launch'].params.parse(valid)).toEqual(valid)
+    expect(
+      methods['providers.launch'].params.parse({ provider: 'grok', columns: 80, rows: 24 }),
+    ).toEqual({ provider: 'grok', columns: 80, rows: 24 })
+    expect(methods['providers.launch'].params.parse({ ...valid, command: 'rm -rf /' })).toEqual(
+      valid,
+    )
+    expect(() =>
+      methods['providers.launch'].params.parse({ provider: 'unlisted-cli', columns: 80, rows: 24 }),
+    ).toThrow()
+    expect(methods['providers.launch'].result.parse({ terminalId: 'term-1' })).toEqual({
+      terminalId: 'term-1',
+    })
+  })
+
+  it('names a fixed GitHub CLI setup action without carrying command text', () => {
+    const valid = { action: 'login', columns: 320, rows: 30 }
+    expect(methods['pullRequests.setup'].params.parse(valid)).toEqual(valid)
+    expect(methods['pullRequests.setup'].params.parse({ ...valid, command: 'rm -rf /' })).toEqual(
+      valid,
+    )
+    expect(() =>
+      methods['pullRequests.setup'].params.parse({ action: 'remove', columns: 100, rows: 30 }),
+    ).toThrow()
+    expect(methods['pullRequests.setup'].result.parse({ terminalId: 'term-github' })).toEqual({
+      terminalId: 'term-github',
+    })
+  })
+
+  it('loads bounded image bytes only from GitHub file and upload URLs', () => {
+    const blob = {
+      url: 'https://github.com/Blueemi/harness/blob/abc123/docs/before.png?raw=true',
+    }
+    const raw = { url: 'https://raw.githubusercontent.com/Blueemi/harness/main/docs/after.png' }
+    expect(methods['pullRequests.image'].params.parse(blob)).toEqual(blob)
+    expect(methods['pullRequests.image'].params.parse(raw)).toEqual(raw)
+    for (const url of [
+      'https://github.com/user-attachments/assets/12345678-1234-1234-1234-123456789abc',
+      'https://private-user-images.githubusercontent.com/123/456-12345678-1234-1234-1234-123456789abc.png',
+    ])
+      expect(methods['pullRequests.image'].params.parse({ url })).toEqual({ url })
+    expect(() =>
+      methods['pullRequests.image'].params.parse({ url: 'https://example.com/image.png' }),
+    ).toThrow()
+    expect(() =>
+      methods['pullRequests.image'].params.parse({ url: 'http://github.com/o/r/blob/x/a.png' }),
+    ).toThrow()
+    expect(() =>
+      methods['pullRequests.image'].params.parse({ url: 'https://github.com.evil.test/a.png' }),
+    ).toThrow()
+
+    const image = { mediaType: 'image/png', data: 'iVBORw0KGgo=' }
+    expect(methods['pullRequests.image'].result.parse(image)).toEqual(image)
+    expect(() =>
+      methods['pullRequests.image'].result.parse({ mediaType: 'text/html', data: 'PGh0bWw+' }),
+    ).toThrow()
+    expect(() =>
+      methods['pullRequests.image'].result.parse({ mediaType: 'image/png', data: '' }),
+    ).toThrow()
+    for (const data of ['not base64!', 'AAA', 'A'.repeat(14 * 1024 * 1024)]) {
+      expect(
+        methods['pullRequests.image'].result.safeParse({ mediaType: 'image/png', data }).success,
+      ).toBe(false)
+    }
+    expect(
+      methods['pullRequests.image'].result.safeParse({
+        mediaType: 'image/svg+xml',
+        data: 'PHN2Zy8+',
+      }).success,
+    ).toBe(true)
+  })
+
+  it('validates data for every declared channel', () => {
+    expect(
+      channels['thread.event'].parse({
+        threadId: 'th1',
+        event: { type: 'turn.completed', turnId: 't1', status: 'completed' },
+      }),
+    ).toBeTruthy()
+    expect(
+      channels['sideChat.event'].parse({
+        threadId: 'side-1',
+        seq: 12,
+        event: { type: 'turn.completed', turnId: 't1', status: 'completed' },
+      }),
+    ).toBeTruthy()
+    expect(
+      channels['thread.queue'].parse({
+        threadId: 'th1',
+        items: [
+          {
+            id: 'queued-1',
+            text: 'Do this next',
+            attachments: [],
+            createdAt: 10,
+          },
+        ],
+        canSteer: false,
+      }),
+    ).toBeTruthy()
+  })
+
+  it('validates the ephemeral Side chat lifecycle', () => {
+    expect(
+      methods['sideChat.start'].params.parse({
+        parentThreadId: 'main-1',
+        model: 'gpt-5.6',
+        effort: 'high',
+        approval: 'ask',
+      }),
+    ).toEqual({
+      parentThreadId: 'main-1',
+      model: 'gpt-5.6',
+      effort: 'high',
+      approval: 'ask',
+    })
+    expect(methods['sideChat.close'].params.parse({ threadId: 'side-1' })).toEqual({
+      threadId: 'side-1',
+    })
+    expect(() => methods['sideChat.start'].params.parse({ parentThreadId: '' })).toThrow()
+  })
+
+  it('keeps background model settings source-aware and non-secret', () => {
+    const target = {
+      mode: 'manual' as const,
+      target: {
+        provider: 'claude-code' as const,
+        agent: 'claude-fork',
+        model: 'haiku',
+        effort: 'low',
+      },
+    }
+    expect(methods['backgroundModel.updateSettings'].params.parse(target)).toEqual(target)
+    const fast = {
+      mode: 'manual' as const,
+      target: { provider: 'codex' as const, model: 'gpt-5.6-luna', serviceTier: 'priority' },
+    }
+    expect(methods['backgroundModel.updateSettings'].params.parse(fast)).toEqual(fast)
+    expect(() =>
+      methods['backgroundModel.updateSettings'].params.parse({
+        ...fast,
+        target: { ...fast.target, serviceTier: '' },
+      }),
+    ).toThrow()
+    expect(() =>
+      methods['backgroundModel.updateSettings'].params.parse({
+        mode: 'manual',
+        target: { provider: 'unlisted-cli', model: 'missing-provider' },
+      }),
+    ).toThrow()
+    expect(
+      methods['backgroundModel.settings'].result.parse({
+        preference: { mode: 'automatic' },
+        sources: [
+          {
+            id: 'codex',
+            displayName: 'Codex',
+            provider: 'codex',
+            models: [
+              {
+                id: 'gpt-5.6-luna',
+                displayName: 'GPT-5.6 Luna',
+                isDefault: false,
+                reasoningEfforts: ['low', 'medium'],
+                serviceTiers: [],
+              },
+            ],
+          },
+        ],
+        resolved: {
+          provider: 'codex',
+          model: 'gpt-5.6-luna',
+          effort: 'medium',
+          sourceName: 'Codex',
+          automatic: true,
+        },
+      }).resolved,
+    ).toMatchObject({ model: 'gpt-5.6-luna', effort: 'medium' })
+    expect(() =>
+      methods['backgroundModel.settings'].result.parse({
+        preference: { mode: 'automatic' },
+        sources: [],
+        resolved: {
+          provider: 'unlisted-cli',
+          model: 'missing-provider',
+          sourceName: 'Unlisted',
+          automatic: true,
+        },
+      }),
+    ).toThrow()
+  })
+})
+
+describe('backward history page contract', () => {
+  const params = methods['thread.history'].params
+  it('keeps legacy replay compatible and supports bounded whole-turn page requests', () => {
+    expect(params.parse({ threadId: 'fixture' })).toEqual({ threadId: 'fixture' })
+    expect(params.parse({ threadId: 'fixture', afterSeq: 12 })).toMatchObject({ afterSeq: 12 })
+    expect(
+      params.parse({ threadId: 'fixture', page: { before: 'opaque-cursor', turnLimit: 50 } }),
+    ).toMatchObject({ page: { before: 'opaque-cursor', turnLimit: 50 } })
+  })
+  it.each([
+    { page: { turnLimit: 0 } },
+    { page: { turnLimit: 101 } },
+    { page: { turnLimit: 1.5 } },
+    { page: { before: '' } },
+    { page: { before: 'x'.repeat(513) } },
+    { page: {}, afterSeq: 0 },
+  ])('rejects ambiguous or unbounded page parameters: %j', (request) => {
+    expect(() => params.parse({ threadId: 'fixture', ...request })).toThrow()
+  })
+  it('distinguishes an exhausted page from a legacy response', () => {
+    const schema = methods['thread.history'].result
+    expect(schema.parse({ events: [], running: false }).page).toBeUndefined()
+    expect(
+      schema.parse({ events: [], running: false, page: { olderCursor: null, snapshotSeq: 42 } })
+        .page,
+    ).toEqual({ olderCursor: null, snapshotSeq: 42 })
+    expect(() =>
+      schema.parse({ events: [], running: false, page: { olderCursor: null, snapshotSeq: -1 } }),
+    ).toThrow()
+  })
+})

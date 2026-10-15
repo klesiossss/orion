@@ -1,0 +1,3757 @@
+@import './button-feedback.css';
+@import './focus-ring.css';
+@import './popup-motion.css';
+
+/* Layout and components. Values come from tokens.css only. */
+
+/* App chrome behaves like native UI. Selection is restored only where copying
+   text or editing it is part of the interaction. */
+:where(
+  input,
+  textarea,
+  [contenteditable='true'],
+  .said__text,
+  .md,
+  .aux__out,
+  .approval__command,
+  .diff__body,
+  .diff-review
+) {
+  user-select: text;
+}
+
+:where(svg.tabler-icon, svg[width][height], svg[aria-hidden='true']) {
+  transform-origin: center;
+}
+
+.shell {
+  display: grid;
+  grid-template-rows: var(--titlebar-h) 1fr;
+  height: 100%;
+}
+
+.shell__body {
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  min-height: 0;
+  /* The rail slides on its own layer; the grid itself snaps so chrome does
+     not relayout on every frame of the collapse or expand. */
+  /* Rail colour behind everything in this row: it is what shows through the
+     stage's rounded top-left corner, so the notch reads as part of the rail. */
+  background: var(--bg-rail);
+}
+
+:root[data-glass='on'][data-shell='desktop']:not([data-theme='light']) .shell__body {
+  /* The OS blur material must stay visible behind the sidebar column. */
+  background: transparent;
+}
+
+.shell.is-narrow .shell__body {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+/* A drag fold keeps the rail at its real width while the column and rail move
+   closed together. Shrinking --rail-w to zero squeezed its text into a thin
+   visible strip until pointer release. */
+.shell[data-rail-fold-preview] .shell__body {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.shell[data-rail-fold-preview] .rail {
+  transform: translateX(-100%);
+}
+
+/* Keep dragging and fold commits instant. Use a data attribute so React's
+   className updates cannot remove this transition override. */
+.shell[data-resizing] .shell__body,
+.shell[data-resizing] .rail-slot.is-collapsed .rail {
+  transition: none;
+}
+
+/* ---------- title bar ---------- */
+
+.titlebar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Keep the chrome itself edge-to-edge while native controls only offset the
+     interactive content inside it. */
+  padding-left: max(12px, env(titlebar-area-x, 12px));
+  padding-right: 6px;
+  width: 100%;
+  /* Match the rail and native caption buttons. The hairline belongs to .stage
+     so it follows the animated column. */
+  background: var(--bg-rail);
+  -webkit-app-region: no-drag;
+  user-select: none;
+}
+
+.titlebar__toggle {
+  position: relative;
+  z-index: 1;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: var(--r-md);
+  color: var(--titlebar-symbol);
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar__drag-region {
+  align-self: stretch;
+  flex: 1;
+  min-width: 0;
+  -webkit-app-region: drag;
+}
+
+.shell.is-narrow .titlebar {
+  background: var(--bg-rail);
+}
+
+/* ---------- rail ---------- */
+
+.rail-slot {
+  position: relative;
+  z-index: 20;
+  min-width: 0;
+  min-height: 0;
+}
+
+.rail {
+  --rail-text: #dcdcda;
+  --rail-font-size: 13px;
+  --rail-font-weight: 400;
+  --rail-letter-spacing: -0.01em;
+  /* One raised surface for the rail: the account card and the active chat. */
+  --rail-raised: color-mix(in srgb, var(--surface-2) 75%, var(--bg-rail-tint));
+  --rail-raised-ring: color-mix(in srgb, var(--text) 6%, transparent);
+  /* The hairline that hangs a project's chats off its folder mark. */
+  --rail-guide: color-mix(in srgb, var(--text) 12%, transparent);
+
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  width: var(--rail-w);
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-rail);
+  font-weight: var(--rail-font-weight);
+  transform: translateX(0);
+  transition: transform var(--dur-slow) var(--ease-rail);
+  /* No border of its own: the stage's left hairline draws the column divider,
+     so the line and the rounded corner belong to one element. */
+}
+
+:root[data-theme='light'] .rail {
+  --rail-text: var(--text);
+  --rail-raised: var(--bg-prompt);
+  --rail-raised-ring: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.rail__folder-drop {
+  position: absolute;
+  z-index: 4;
+  inset: 8px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 16px;
+  border: 1px dashed var(--text-2);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  color: var(--rail-text);
+  font-size: var(--t-sm);
+  text-align: center;
+  pointer-events: none;
+}
+
+.rail__folder-drop svg {
+  color: var(--text-2);
+}
+
+.rail-slot.is-collapsed .rail {
+  /* The temporary reveal is the real sidebar: same width as before the
+     collapse and a proper frame of its own, not a bare slab. */
+  border: 1px solid var(--line);
+  border-left: 0;
+  border-radius: 0 var(--r-lg) var(--r-lg) 0;
+  transform: translateX(-100%);
+  /* Promote the hidden flyout before the pointer arrives. Waiting until the
+     first reveal frame made Chromium build the full-height layer on demand. */
+  will-change: transform;
+}
+
+.rail-slot.is-collapsed.is-revealed .rail {
+  box-shadow: var(--shadow-rail);
+  transform: translateX(0);
+}
+
+/* The flyout shows and retracts faster than the real collapse fold;
+   is-reveal-out covers the retract, after the revealed class is gone. */
+.rail-slot.is-collapsed.is-revealed .rail,
+.rail-slot.is-collapsed.is-reveal-out .rail {
+  transition: transform var(--dur-reveal) var(--ease-rail);
+}
+
+/* While revealed, the drag edge rides the flyout's right side instead of the
+   zero-width column the rail slot collapses to. */
+.rail-slot.is-collapsed.is-revealed .rail__resize {
+  left: calc(var(--rail-w) - 3px);
+  right: auto;
+}
+
+.rail__backdrop {
+  display: none;
+}
+
+.rail__edge {
+  position: absolute;
+  z-index: 1;
+  inset: 0 auto 0 0;
+  width: 6px;
+}
+
+.rail__resize {
+  position: absolute;
+  z-index: 2;
+  inset: 0 -3px 0 auto;
+  width: 6px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.rail__resize::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border-top: 2px solid var(--line-strong);
+  border-left: 2px solid var(--line-strong);
+  border-top-left-radius: var(--r-lg);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.rail__resize::after {
+  content: '';
+  position: absolute;
+  /* Stops short of the stage's rounded corner above and mirrors it below,
+     with rounded ends of its own. */
+  inset: 12px 2px;
+  border-radius: var(--r-pill);
+  background: var(--line-strong);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.rail__resize:is(:hover, :focus-visible)::before,
+.rail__resize:is(:hover, :focus-visible)::after,
+.shell[data-resizing] .rail__resize::before,
+.shell[data-resizing] .rail__resize::after {
+  opacity: 1;
+}
+
+.rail__actions {
+  padding: 8px 10px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-bottom: 1px solid transparent;
+}
+
+.rail__actions.is-scrolled {
+  border-bottom-color: var(--line-strong);
+}
+
+/* New chat and search share one row: the search icon rides on the right,
+   quiet by default, surfaced only on hover or focus. */
+.rail__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.rail__row .navitem {
+  flex: 1;
+  min-width: 0;
+}
+
+.rail__new-project {
+  min-width: 0;
+  width: 100%;
+}
+
+.rail__new-project > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Sized and rounded exactly like the navitems beside it — one family. */
+.rail__search {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  cursor: pointer;
+  font: inherit;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.rail__search:is(:hover, :focus-visible) {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.navitem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--rail-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--rail-font-size);
+  font-weight: var(--rail-font-weight);
+  letter-spacing: var(--rail-letter-spacing);
+  min-height: 26px;
+  padding: 4px 7px;
+  text-align: left;
+  transition:
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+  width: 100%;
+}
+
+.navitem:hover,
+.navitem:focus-visible {
+  background: var(--control-hover);
+  color: var(--rail-text);
+}
+
+.navitem svg {
+  color: var(--text-3);
+  flex: none;
+}
+
+.navitem:hover svg {
+  color: var(--text-2);
+}
+
+/* All three top actions share the quiet navitem look at a tighter height;
+   the transparent border keeps them the exact size of the active PR state. */
+.rail__actions .navitem {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+}
+
+.rail__pull-requests {
+  position: relative;
+  border: 1px solid transparent;
+}
+
+.rail__pull-requests.is-active {
+  background: var(--chrome-raised);
+  border-color: var(--chrome-border);
+  box-shadow: var(--chrome-shadow);
+  color: var(--rail-text);
+}
+
+.rail__pull-requests.is-active svg {
+  color: var(--success);
+}
+
+.rail__body {
+  overflow-y: auto;
+  padding: 8px 4px 18px 10px;
+  /* Same reason as .thread: the list must not shift when it crosses the fold. */
+  scrollbar-gutter: stable;
+}
+
+/* The 8px side inset matches Menu's viewport gutter. At 6px the trigger sat
+   left of the edge a menu may use, so its popup could not line up with it. */
+.rail__foot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  padding: 4px 8px 8px;
+}
+
+.account-menu__actions {
+  display: grid;
+  flex: none;
+  gap: 0;
+  padding-top: 0;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding: 0 8px;
+  background: var(--chrome-recessed);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--chrome-inset-shadow);
+  color: var(--text-3);
+}
+
+.search:focus-within {
+  border-color: var(--text-3);
+}
+
+/* Inline rename, sized to sit exactly where the label was. */
+.rename {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  color: var(--rail-text);
+  font: inherit;
+  font-size: var(--t-sm);
+  outline: none;
+  padding: 4px 8px;
+}
+
+.sessrow {
+  --sess-bg: transparent;
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  height: 28px;
+  background: var(--sess-bg);
+  border-radius: var(--r-md);
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+.sessrow:hover {
+  --sess-bg: var(--surface);
+}
+
+.sessrow.is-active {
+  --sess-bg: color-mix(in srgb, var(--surface-2) 75%, var(--bg-rail-tint));
+  box-shadow: none;
+}
+
+:root[data-theme='light'] .sessrow.is-active {
+  --sess-bg: var(--chrome-raised);
+  box-shadow: var(--chrome-shadow);
+}
+
+/* One pill marks the active chat: on a project's guide, or in the outer
+   gutter for pinned chats. It slides between rows by transform alone
+   (active-indicator.ts); the row's own fill only cross-fades. */
+.sessrow__indicator {
+  position: absolute;
+  z-index: 1;
+  top: 7px;
+  left: var(--sess-indicator-x);
+  width: 3px;
+  height: 14px;
+  border-radius: var(--r-pill);
+  background: var(--text-2);
+  pointer-events: none;
+}
+
+.sessrow.is-reorderable .sess {
+  cursor: grab;
+}
+
+.sessrow.is-dragging {
+  opacity: 0.45;
+}
+
+.sessrow.is-dragging .sess {
+  cursor: grabbing;
+}
+
+/* ::after: the active row's accent tick is a later ::before and would hide
+   the drop line on the row you are already in. */
+.sessrow[data-drop-position]::after {
+  content: '';
+  position: absolute;
+  z-index: 2;
+  /* Starts where the title does. */
+  left: calc(var(--sess-indent) + 19px);
+  right: 6px;
+  height: 2px;
+  border-radius: var(--r-pill);
+  background: var(--light);
+  pointer-events: none;
+}
+
+.sessrow[data-drop-position='before']::after {
+  top: -1px;
+}
+
+.sessrow[data-drop-position='after']::after {
+  bottom: -1px;
+}
+
+.sessrow:focus-within .sess__actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.sessrow:focus-within .sess__meta {
+  opacity: 0;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .sessrow:hover .sess__actions,
+  .proj__head:hover .dots {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .sessrow:hover .sess__meta {
+    opacity: 0;
+  }
+
+  .sessrow:hover .sess__provider {
+    color: var(--text-2);
+  }
+
+  .sess:hover {
+    color: var(--rail-text);
+  }
+
+  .proj__head:hover {
+    background: var(--control-hover);
+  }
+
+  .proj__head:hover .icon-btn {
+    opacity: 1;
+  }
+
+  .proj__toggle:hover {
+    color: var(--rail-text);
+  }
+
+  .menutrigger:hover .dots {
+    color: var(--text);
+    opacity: 1;
+  }
+}
+
+.dots {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.proj__head > .menuwrap .menutrigger {
+  padding: 0;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- settings sheet ---------- */
+
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+}
+
+.sheet__scrim {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  border: 0;
+  cursor: default;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.sheet__panel {
+  position: relative;
+  width: 100%;
+  max-width: 460px;
+  max-height: 100%;
+  overflow-y: auto;
+  background: var(--bg-rail);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-dialog);
+  box-shadow: var(--shadow-modal);
+}
+
+.sheet__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+}
+
+.sheet__title {
+  font-size: var(--t-lg);
+  font-weight: 560;
+  letter-spacing: -0.014em;
+  margin: 0;
+}
+
+.sheet__section {
+  padding: 12px 16px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.sheet__label {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  font-weight: 500;
+  margin: 0 0 10px;
+}
+
+.sheet__note {
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  line-height: 1.6;
+  margin: 10px 0 0;
+}
+
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.row__title {
+  margin: 0;
+  font-size: var(--t-md);
+}
+
+.row__note {
+  margin: 2px 0 0;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+}
+
+.switch {
+  position: relative;
+  width: 36px;
+  height: 22px;
+  flex: none;
+  padding: 0;
+  background: var(--surface-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+.switch.is-on {
+  background: var(--light);
+  border-color: var(--light);
+  color: var(--on-light);
+}
+
+:root[data-theme='light'] .switch:not(.is-on) {
+  background: var(--chrome-recessed);
+  border-color: var(--chrome-border);
+  box-shadow: var(--chrome-inset-shadow);
+}
+
+.switch__thumb {
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  translate: 0 -50%;
+  background: var(--text-2);
+  border-radius: var(--r-circle);
+  transition:
+    transform var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+
+.switch.is-on .switch__thumb {
+  background: var(--on-light);
+  transform: translateX(14px);
+}
+
+.section {
+  margin: 10px 0 5px;
+  padding: 0 7px;
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 1.2;
+}
+
+.section--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 3px;
+}
+
+.section__add {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.section__add:is(:hover, :focus-visible) {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.rail__hint {
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  margin: 0;
+  padding: 2px 8px;
+}
+
+/* ---------- projects & sessions ---------- */
+
+.proj {
+  position: relative;
+  margin-bottom: 4px;
+}
+
+.proj[draggable='true'] > .proj__head {
+  cursor: grab;
+}
+
+.proj.is-dragging {
+  opacity: 0.42;
+}
+
+.proj[data-drop-position]::before {
+  content: '';
+  position: absolute;
+  z-index: 2;
+  right: 6px;
+  left: 26px;
+  height: 2px;
+  border-radius: var(--r-pill);
+  background: var(--light);
+  pointer-events: none;
+}
+
+.proj[data-drop-position='before']::before {
+  top: -1px;
+}
+
+.proj[data-drop-position='after']::before {
+  bottom: -1px;
+}
+
+.proj__head {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  height: 28px;
+  min-height: 28px;
+  padding-right: 4px;
+  border-radius: var(--r-md);
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+.proj:has(.proj__toggle:focus-visible) > .proj__head {
+  background: var(--control-hover);
+}
+
+.proj__head > .icon-btn {
+  width: 28px;
+  height: 28px;
+}
+
+.proj__toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--rail-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--rail-font-size);
+  font-weight: var(--rail-font-weight);
+  letter-spacing: var(--rail-letter-spacing);
+  height: 28px;
+  min-height: 28px;
+  padding: 2px 7px;
+  text-align: left;
+}
+
+.proj__mark {
+  background: currentColor;
+  color: var(--text-2);
+  flex: none;
+  width: 13px;
+  height: 13px;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5%204h4l3%203h7a2%202%200%200%201%202%202v8a2%202%200%200%201%20-2%202h-14a2%202%200%200%201%20-2%20-2v-11a2%202%200%200%201%202%20-2'/%3E%3C/svg%3E")
+    center / 13px 13px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5%204h4l3%203h7a2%202%200%200%201%202%202v8a2%202%200%200%201%20-2%202h-14a2%202%200%200%201%20-2%20-2v-11a2%202%200%200%201%202%20-2'/%3E%3C/svg%3E")
+    center / 13px 13px no-repeat;
+}
+
+.proj__name {
+  flex: 1;
+  /* Parents carry the weight; their chats read lighter beneath them. */
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 'auto' cannot be transitioned, but 0fr → 1fr can, and it measures the real
+   content — no per-row guess, and no dead time at either end. */
+.proj__drawer {
+  display: grid;
+  grid-template-rows: 0fr;
+  overflow: hidden;
+  transition:
+    grid-template-rows var(--dur-slow) var(--ease-out),
+    opacity var(--dur-fast) var(--ease-out);
+}
+
+.proj__drawer[data-open='true'] {
+  grid-template-rows: 1fr;
+}
+
+.proj__drawer[data-open='false'] {
+  opacity: 0;
+}
+
+.proj__drawer[data-open='false'] > .proj__sessions {
+  margin-block: 0;
+}
+
+.proj__drawer > .proj__sessions {
+  /* A project's chats indent past the guide under its folder mark. */
+  --sess-indent: 22px;
+  --sess-indicator-x: 12px;
+  min-height: 0;
+}
+
+/* The guide runs from under the folder mark (centre 13.5px) to the middle of
+   the last row. It hangs on the project so the drawer's clip cannot cut it,
+   and paints nothing once the drawer is shorter than the offsets. */
+.proj::after {
+  content: '';
+  position: absolute;
+  top: 24px;
+  bottom: 22px;
+  left: 13px;
+  width: 1px;
+  border-radius: var(--r-pill);
+  background: var(--rail-guide);
+  pointer-events: none;
+}
+
+.proj__sessions {
+  /* Pinned chats have no parent, so they keep the outer gutter. */
+  --sess-indent: 7px;
+  --sess-indicator-x: 1px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  row-gap: 2px;
+  list-style: none;
+  margin: 2px 0 8px;
+  padding: 0;
+  /* Let the grid item shrink so long titles reach their ellipsis boundary. */
+  min-width: 0;
+  max-width: 100%;
+}
+
+.proj__sessions--virtual {
+  position: relative;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-anchor: none;
+  contain: layout paint style;
+  scrollbar-width: thin;
+}
+
+.proj__sessions--virtual::before {
+  content: '';
+  display: block;
+  width: 1px;
+  height: var(--virtual-session-height);
+}
+
+.proj__sessions--virtual > :is(.sessrow, .proj__sessions-toggle-row) {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+}
+
+.proj__sessions-toggle {
+  width: 100%;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 8px 0 calc(var(--sess-indent) + 21px);
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--rail-font-size);
+  font-weight: var(--rail-font-weight);
+  letter-spacing: var(--rail-letter-spacing);
+  text-align: left;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.proj__sessions-toggle-row {
+  min-width: 0;
+}
+
+.proj__sessions-toggle:is(:hover, :focus-visible) {
+  color: var(--rail-text);
+}
+
+.sess {
+  flex: 1;
+  width: 100%;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--rail-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--rail-font-size);
+  font-weight: var(--rail-font-weight);
+  letter-spacing: var(--rail-letter-spacing);
+  /* No standing reservation for the hover actions: they overlay the right
+     edge with their own fade, so the title keeps the full row width and the
+     rail stays honest at any size. */
+  padding: 0 8px 0 var(--sess-indent);
+  text-align: left;
+  min-width: 0;
+  transition: color var(--dur-fast) var(--ease-out);
+  /* Nothing in the rail wraps. Titles are arbitrary user text and a row that
+     grows taller as the title grows makes the whole list unstable. */
+  white-space: nowrap;
+}
+
+.sess:hover {
+  color: var(--rail-text);
+}
+
+.sessrow.is-active .sess {
+  color: var(--rail-text);
+}
+
+.sessrow > .rename--session {
+  height: 28px;
+  /* The field's text starts where the title did: indent + mark + gap. */
+  padding: 0 12px 0 calc(var(--sess-indent) + 21px);
+  color: color-mix(in srgb, var(--text-2) 82%, transparent);
+  font-size: var(--rail-font-size);
+  font-weight: var(--rail-font-weight);
+  letter-spacing: var(--rail-letter-spacing);
+}
+
+/* Pinned chats keep the same 28px title indent as project chats, so every
+   chat title in the rail starts on one line under the project names. */
+.pinned-sessions {
+  margin: 0 0 10px;
+}
+
+.proj__sessions > .rail__hint {
+  padding-left: calc(var(--sess-indent) + 21px);
+}
+
+.sess__title {
+  flex: 1;
+  /* min-width lets the title shrink and ellipsize first, so the status dot
+     and spinner never get pushed out of the row at narrow widths. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-theme='dark'] .sess__title {
+  color: color-mix(in srgb, var(--rail-text) 78%, transparent);
+}
+
+.sessrow:is(.is-active, .is-unread) .sess__title {
+  color: var(--rail-text);
+}
+
+.sessrow.is-unread .sess__title {
+  font-weight: 560;
+}
+
+.sess__provider {
+  display: grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--text-3);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.sessrow.is-active .sess__provider {
+  color: var(--text-2);
+}
+
+.sess__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.sess__time {
+  color: color-mix(in srgb, var(--text-2) 50%, var(--text-3));
+  font-size: var(--t-xs);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.sess__unread-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-circle);
+  background: var(--light);
+  flex: none;
+}
+
+.sess__actions {
+  position: absolute;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding-left: 12px;
+  border-radius: 0 var(--r-md) var(--r-md) 0;
+  background: linear-gradient(90deg, transparent, var(--sess-bg) 10px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.sess__action {
+  display: grid;
+  place-items: center;
+  /* A 28px target with a 24px face: the hover fill stays inside the row. */
+  width: 28px;
+  height: 28px;
+  padding: 2px;
+  background: none;
+  /* After the shorthand, which would reset it. */
+  background-clip: content-box;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.sess__action:hover,
+.sess__action:focus-visible {
+  background-color: var(--surface-3);
+  color: var(--text);
+}
+
+.sess__spinner {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--running);
+  animation: spin 800ms linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sess__spinner {
+    animation: none;
+  }
+}
+
+.sess__status-dot {
+  width: 6px;
+  height: 6px;
+  margin: 0 3px;
+  border-radius: var(--r-circle);
+  flex: none;
+}
+
+.sess__status-dot.is-attention {
+  background: var(--attention);
+}
+
+.sess__status-dot.is-failed {
+  background: var(--error);
+}
+
+/* ---------- stage ---------- */
+
+/* The right panel width is written inline on .workspace-layout on every frame
+   of a resize drag, and only that grid reads it. Left inheritable, each write
+   restyled the whole chat and Browser subtree under it (about 9 ms a frame next
+   to a long chat); not inherited, it restyles one element. */
+@property --workspace-panel-w {
+  syntax: '*';
+  inherits: false;
+}
+
+.workspace-layout {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  grid-template-columns: minmax(0, 1fr) 0px;
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
+  background: var(--bg);
+}
+
+.workspace-layout.is-panel-open {
+  grid-template-columns: minmax(360px, 1fr) min(var(--workspace-panel-w), calc(100% - 360px));
+}
+
+.workspace-layout.is-panel-expanded {
+  grid-template-columns: minmax(0, 1fr) 100%;
+}
+
+.workspace-layout > .stage {
+  min-width: 0;
+  transition: opacity var(--dur-slow) var(--ease-out);
+}
+
+.workspace-layout.is-panel-expanded > .stage {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (max-width: 900px) {
+  .workspace-layout.is-panel-open {
+    grid-template-columns: minmax(0, 1fr) 100%;
+  }
+
+  .workspace-layout.is-panel-open > .stage {
+    opacity: 0;
+    pointer-events: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-layout,
+  .workspace-layout > .stage {
+    transition: none;
+  }
+}
+
+.stage {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+  /* Keep the frame on the pane so its hairline follows the animated column. */
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+  border-top-left-radius: var(--r-lg);
+  overflow: hidden;
+  container: chat-stage / inline-size;
+}
+
+.shell.is-narrow .stage {
+  border-left: 0;
+  border-top-left-radius: 0;
+}
+
+.stage__body {
+  position: relative;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  border-top-left-radius: inherit;
+}
+
+.stage__conversation {
+  position: relative;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+  --composer-overlay-height: 120px;
+}
+
+.stage__conversation.is-new-session {
+  align-content: center;
+  grid-template-rows: auto auto;
+}
+
+.stage__conversation:not(.is-new-session) > .composer {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Hide the transcript under the floating composer; keep the scrollbar clear. */
+.stage__conversation:not(.is-new-session) > .composer::before {
+  position: absolute;
+  inset: 0 10px 0 0;
+  z-index: -1;
+  background: linear-gradient(to bottom, transparent, var(--bg) 12px);
+  content: '';
+  pointer-events: none;
+}
+
+.stage__conversation:not(.is-new-session) > .composer .composer__box {
+  pointer-events: auto;
+}
+
+.stage__conversation:not(.is-new-session) .thread {
+  padding-bottom: calc(var(--composer-overlay-height) + 4px);
+}
+
+.stage__conversation:not(.is-new-session) .jump {
+  bottom: calc(var(--composer-overlay-height) + 14px);
+}
+
+.stage > .pr-workspace {
+  grid-row: 1 / -1;
+  border-top-left-radius: inherit;
+}
+
+.stage__body.is-new-session {
+  align-content: center;
+  grid-template-rows: auto;
+  /* Use padding for the small upward bias; transforms would re-anchor fixed menus. */
+  padding-bottom: max(clamp(0px, 1.5vh, 14px), clamp(0px, calc(648px - 100vh), 188px));
+}
+
+.stage__body.has-terminal {
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+/* A fresh chat has enough open space for the terminal to overlay the bottom
+   edge. Keep its two centered rows unchanged so the heading and composer do
+   not jump when the terminal opens. */
+.stage__body.is-new-session.has-terminal {
+  grid-template-rows: auto;
+}
+
+.stage__body.is-new-session > .bottom-terminal {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  max-height: max(160px, calc(50% - 124px));
+}
+
+.stage__body.is-new-session > .bottom-terminal > .terminal-pane {
+  max-height: 100%;
+}
+
+.bottom-terminal {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  contain: layout paint;
+  overflow: hidden;
+  background: var(--bg);
+  transform: translate3d(0, 100%, 0);
+  transition: transform var(--dur-slow) var(--ease-rail);
+  will-change: transform;
+}
+
+.bottom-terminal.is-open {
+  transform: translate3d(0, 0, 0);
+}
+
+@starting-style {
+  .bottom-terminal.is-open {
+    transform: translate3d(0, 100%, 0);
+  }
+}
+
+.bottom-terminal.is-closing {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+
+.bottom-terminal.is-parked {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.stagehead {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 14px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+
+.stagehead__drag-region {
+  display: none;
+}
+
+.stagehead__identity {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+}
+
+.stagehead__title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stagehead__rename {
+  width: auto;
+  min-width: 6ch;
+  max-width: min(320px, 45vw);
+  height: 28px;
+  padding: 0;
+  field-sizing: content;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 550;
+}
+
+.rename--chat,
+.stagehead__rename {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  color: color-mix(in srgb, var(--text-2) 82%, transparent);
+  caret-color: AccentColor;
+}
+
+.rename--chat::selection,
+.stagehead__rename::selection {
+  background: AccentColor;
+  color: color-mix(in srgb, AccentColorText 88%, AccentColor);
+}
+
+.stagehead__menu-trigger,
+.stagehead__action {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+}
+
+.stagehead__menu-trigger:is(:hover, :focus-visible),
+.stagehead__action:is(:hover, :focus-visible),
+.stagehead__action.is-open {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.menu.stagehead__options-menu {
+  min-width: 0;
+  width: min(216px, calc(100vw - 16px));
+  max-height: min(480px, calc(100vh - 58px));
+  scrollbar-width: none;
+}
+
+.menu.stagehead__options-menu::-webkit-scrollbar {
+  display: none;
+}
+
+.panel-toggles {
+  position: fixed;
+  z-index: 31;
+  top: calc(var(--titlebar-h) + 7px);
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+}
+
+.panel-toggles.is-workspace-open {
+  right: 44px;
+}
+
+/* The fixed toggles float over the header's right edge while the workspace
+   panel is closed: reserve their width so a long title truncates first. */
+.shell:has(> .panel-toggles:not(.is-workspace-open)) .stagehead {
+  padding-right: 44px;
+}
+
+.shell:has(> .panel-toggles:not(.is-workspace-open) > .panel-toggles__terminal) .stagehead {
+  padding-right: 80px;
+}
+
+.zoom-hud {
+  position: fixed;
+  z-index: 40;
+  top: calc(var(--titlebar-h) + 10px);
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-flyout);
+  color: var(--text-2);
+}
+
+.zoom-hud button {
+  display: inline-flex;
+  min-width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+}
+
+.zoom-hud button:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.zoom-hud button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.zoom-hud output {
+  min-width: 48px;
+  color: var(--text);
+  font-size: var(--t-sm);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.zoom-hud__rule {
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--line-strong);
+}
+
+.zoom-hud .zoom-hud__reset {
+  padding-inline: 9px;
+}
+
+/* macOS keeps the traffic lights, but they belong to the sidebar rather than
+   an empty full-width row. The stage and every divider start at the window's
+   top edge; only sidebar content keeps the native-control safe area. */
+.shell.is-macos {
+  position: relative;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.shell.is-macos .shell__body {
+  grid-row: 1;
+}
+
+.shell.is-macos .titlebar {
+  position: absolute;
+  z-index: 30;
+  inset: 0 auto auto 0;
+  width: var(--rail-w);
+  height: 42px;
+  padding-bottom: 1px;
+  background: transparent;
+}
+
+.shell.is-macos.is-narrow .titlebar,
+.shell.is-macos[data-rail-fold-preview] .titlebar {
+  width: calc(max(12px, env(titlebar-area-x, 12px)) + 42px);
+  -webkit-app-region: no-drag;
+}
+
+.shell.is-macos.is-narrow .titlebar__drag-region,
+.shell.is-macos[data-rail-fold-preview] .titlebar__drag-region {
+  -webkit-app-region: no-drag;
+}
+
+.shell.is-macos .rail {
+  padding-top: var(--titlebar-h);
+}
+
+.shell.is-macos .stagehead {
+  -webkit-app-region: no-drag;
+}
+
+.shell.is-macos .stagehead__drag-region {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  /* Panel toggles are fixed siblings, so their no-drag region cannot cut a
+     hole in this element. Stop the native drag surface before their furthest
+     left position (both controls while workspace tools are open). */
+  right: 116px;
+  display: block;
+  -webkit-app-region: drag;
+}
+
+.shell.is-macos .stagehead :is(button, input),
+.shell.is-macos .pr-list-head :is(button, input) {
+  -webkit-app-region: no-drag;
+}
+
+.shell.is-macos.is-narrow .stagehead,
+.shell.is-macos[data-rail-fold-preview] .stagehead {
+  padding-left: calc(max(12px, env(titlebar-area-x, 12px)) + 42px);
+}
+
+.shell.is-macos.is-narrow .stagehead__drag-region,
+.shell.is-macos[data-rail-fold-preview] .stagehead__drag-region {
+  left: calc(max(12px, env(titlebar-area-x, 12px)) + 42px);
+}
+
+.shell.is-macos .panel-toggles {
+  top: 7px;
+}
+
+.shell.is-macos .zoom-hud {
+  top: 10px;
+}
+
+.shell.is-macos .pr-list-head {
+  -webkit-app-region: drag;
+}
+
+.picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: var(--t-md);
+  font-weight: 520;
+  white-space: nowrap;
+}
+
+.picker svg {
+  color: var(--text-3);
+  flex: none;
+}
+
+/* ---------- composer ---------- */
+
+.composer {
+  min-width: 0;
+  padding: 4px 24px 8px;
+}
+
+.composer:not(.is-new-session) {
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
+.composer__box {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  max-width: var(--chat-w);
+  margin: 0 auto;
+  border-radius: var(--r-composer);
+  /* Archiving replaces the thread in the same commit as this FLIP. Keep the
+     bounded visual box promoted so that work cannot delay layer creation. */
+  will-change: transform;
+}
+
+.composer__prompt {
+  position: relative;
+  z-index: 1;
+  background: var(--bg-prompt);
+  border: 1px solid var(--line);
+  border-radius: var(--r-composer);
+  box-shadow: var(--composer-shadow);
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.composer__design-beam.is-shelved {
+  margin-top: 0;
+}
+
+.composer__prompt:focus-within {
+  border-color: var(--line-strong);
+}
+
+.composer__box.is-dropping .composer__prompt {
+  border-color: var(--text-2);
+  background: var(--surface-2);
+}
+
+.composer__shelf {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  min-width: 0;
+  min-height: 32px;
+  margin: 0;
+  padding: 1px 10px;
+  background: var(--bg-shelf);
+  border-radius: var(--r-composer) var(--r-composer) 0 0;
+  box-shadow: inset 0 -1px color-mix(in srgb, var(--line) 70%, transparent);
+}
+
+.composer__shelf::after {
+  position: absolute;
+  right: 0;
+  bottom: calc(-1 * var(--r-composer));
+  left: 0;
+  height: calc(var(--r-composer) + 2px);
+  background: var(--bg-shelf);
+  content: '';
+  pointer-events: none;
+}
+
+.composer__shelf .menuwrap {
+  flex: none;
+  min-width: 0;
+}
+
+.composer__shelf .menuwrap:first-child {
+  max-width: 260px;
+}
+
+.composer__shelf .menuwrap:last-child {
+  max-width: 220px;
+}
+
+.composer__queue {
+  position: absolute;
+  right: 28px;
+  bottom: calc(100% - 9px);
+  left: 28px;
+  min-width: 0;
+  max-height: min(40vh, 280px);
+  margin: 0;
+  padding: 3px 7px 7px;
+  overflow-y: auto;
+  background: var(--bg-queue);
+  border: 1px solid var(--queue-line);
+  border-bottom: 0;
+  border-radius: var(--r-composer) var(--r-composer) 0 0;
+  animation: composer-queue-panel-in var(--dur-slow) var(--ease-rail) both;
+}
+
+@keyframes composer-queue-panel-in {
+  from {
+    clip-path: inset(100% 0 0);
+    opacity: 0;
+  }
+
+  to {
+    clip-path: inset(0 0 0);
+    opacity: 1;
+  }
+}
+
+.queue-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 22px;
+  padding: 0 5px;
+  opacity: 1;
+  color: var(--queue-text);
+  will-change: transform, opacity;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-press) var(--ease-out);
+}
+
+.queue-row[data-queue-phase='entering'] {
+  animation: composer-queue-item-in var(--dur-slow) var(--ease-in-out) both;
+}
+
+.queue-row[data-queue-phase='exiting'] {
+  z-index: 1;
+  pointer-events: none;
+  animation: composer-queue-item-out var(--dur-fast) var(--ease-out) both;
+}
+
+.queue-row[data-queue-phase='exiting'][data-queue-positioned] {
+  position: absolute;
+}
+
+@keyframes composer-queue-item-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes composer-queue-item-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes composer-queue-item-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes composer-queue-item-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+.queue-row.is-dragging {
+  opacity: 0.4;
+  transform: scale(0.99);
+}
+
+.queue-row[data-drop-position]::before {
+  content: '';
+  position: absolute;
+  right: 5px;
+  left: 5px;
+  height: 2px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.queue-row[data-drop-position='before']::before {
+  top: -1px;
+}
+
+.queue-row[data-drop-position='after']::before {
+  bottom: -1px;
+}
+
+.queue-row__handle {
+  display: grid;
+  width: 22px;
+  flex: none;
+  padding: 0;
+  place-items: center;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--queue-action);
+  cursor: grab;
+}
+
+.queue-row__handle:hover,
+.queue-row__handle:focus-visible {
+  background: var(--queue-hover);
+  color: var(--text);
+}
+
+.queue-row__text {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: var(--t-xs);
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-row__media {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  padding: 0;
+  overflow: hidden;
+  place-items: center;
+  background: var(--chrome-recessed);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--chrome-inset-shadow);
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.queue-row__media:disabled {
+  opacity: 1;
+  cursor: default;
+}
+
+.queue-row__media-fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--chrome-recessed);
+}
+
+.queue-row__media img {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.queue-row__media-play {
+  position: absolute;
+  z-index: 2;
+  bottom: 1px;
+  left: 1px;
+  display: grid;
+  width: 9px;
+  height: 9px;
+  padding-left: 1px;
+  place-items: center;
+  background: rgb(14 14 15 / 78%);
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: var(--r-md);
+  color: rgb(250 250 250 / 92%);
+}
+
+.queue-row__steer,
+.queue-row__action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  height: 22px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--queue-action);
+  cursor: pointer;
+  font: inherit;
+}
+
+.queue-row__steer {
+  gap: 5px;
+  padding: 0 7px;
+  font-size: var(--t-xs);
+  line-height: 1.1;
+}
+
+.queue-row__action {
+  width: 24px;
+  padding: 0;
+}
+
+.queue-row__steer:hover,
+.queue-row__action:hover {
+  background: var(--queue-hover);
+  color: var(--text);
+}
+
+.queue-row > .menuwrap {
+  flex: none;
+}
+
+.queue-row > .menuwrap .queue-row__action {
+  width: 24px;
+  height: 22px;
+  justify-content: center;
+  padding: 0;
+}
+
+.queue-row > .menuwrap .queue-row__action:hover {
+  background: var(--queue-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer__queue {
+    animation: fade-in var(--dur-fast) var(--ease-out) both !important;
+  }
+
+  .queue-row {
+    transition: opacity var(--dur-fast) var(--ease-out);
+  }
+
+  .queue-row[data-queue-phase='entering'] {
+    animation: composer-queue-item-fade-in var(--dur-press) var(--ease-out) both !important;
+  }
+
+  .queue-row[data-queue-phase='exiting'] {
+    animation: composer-queue-item-fade-out var(--dur-press) var(--ease-out) both !important;
+  }
+
+  .queue-row.is-dragging {
+    transform: none;
+  }
+}
+
+.shelf-control {
+  width: auto;
+  max-width: 100%;
+  padding: 3px 5px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+  box-shadow: none;
+  transition:
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.menutrigger.shelf-control {
+  border-radius: var(--r-md);
+}
+
+.shelf-control--mode {
+  flex: none;
+  max-width: 150px;
+}
+
+/* Scoped to the shelf so this outranks the flat .menutrigger:hover background,
+   and the plain workspace-mode button picks up the same treatment. */
+.composer__shelf .shelf-control:hover:not(:disabled) {
+  background: var(--control-hover);
+  box-shadow: none;
+  color: var(--text);
+}
+
+.shelf-control[aria-expanded='true'] {
+  color: var(--text);
+}
+
+.shelf-control__content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.shelf-control__content svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: currentColor;
+}
+
+.shelf-control__content span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shelf-control:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.branch-menu {
+  min-width: min(320px, calc(100vw - 16px));
+}
+
+.branch-menu__search {
+  margin: 2px 2px 4px;
+}
+
+.branch-menu__results {
+  display: grid;
+  gap: 2px;
+}
+
+.branch-menu__empty {
+  margin: 0;
+  padding: 20px 8px;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  text-align: center;
+}
+
+.stat--add {
+  color: var(--success);
+}
+
+.stat--del {
+  color: var(--error);
+}
+
+.composer textarea {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-lg);
+  line-height: 1.45;
+  min-height: 48px;
+  padding: 12px 16px 6px;
+  resize: none;
+  outline: none;
+  max-height: 242px;
+  overflow-y: hidden;
+}
+
+.composer textarea::placeholder {
+  color: var(--composer-placeholder);
+}
+
+.composer textarea:disabled {
+  cursor: not-allowed;
+}
+
+/* ---------- context chip & tool row ---------- */
+
+.chips {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 9px 10px 0;
+}
+
+.chips:empty {
+  display: none;
+}
+
+.chips > :is(.chip, .attachment-preview) {
+  animation: composer-chip-in var(--dur-fast) var(--ease-out) both;
+}
+
+@keyframes composer-chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px) scale(0.98);
+  }
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px 8px 3px 7px;
+  max-width: 100%;
+  background: var(--surface-2);
+  border-radius: var(--r-md);
+  color: var(--text-2);
+  font-size: var(--t-sm);
+}
+
+/* The project name is the identity; the branch is the detail. When space runs
+   out the branch gives way first. */
+.chip--context .chip__label {
+  flex: none;
+  max-width: 180px;
+}
+
+.chip svg {
+  color: var(--text-3);
+  flex: none;
+}
+
+.chip__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip--file {
+  max-width: 220px;
+  padding-right: 3px;
+}
+
+.chip--resource {
+  max-width: 260px;
+  padding: 5px 4px 5px 7px;
+  background: color-mix(in srgb, var(--attention) 10%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--attention) 35%, var(--line-strong));
+  color: color-mix(in srgb, var(--attention) 62%, var(--text));
+  font-size: var(--t-md);
+}
+
+.chip--resource > svg {
+  color: var(--attention);
+}
+
+.chip--error {
+  color: var(--error);
+}
+
+.attachment-preview {
+  position: relative;
+  display: block;
+  order: -1;
+  width: 64px;
+  height: 64px;
+  flex: none;
+}
+
+.attachment-preview img {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: calc(var(--r-xl) - 1px);
+}
+
+.attachment-preview img[hidden] {
+  display: none;
+}
+
+.attachment-preview__open {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+  background: var(--chrome-recessed);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--r-xl);
+  box-shadow: var(--chrome-inset-shadow);
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.attachment-preview__open:disabled {
+  cursor: default;
+}
+
+.attachment-preview.is-loading img {
+  opacity: 0.64;
+}
+
+.attachment-preview__fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--chrome-recessed);
+}
+
+.attachment-preview__play {
+  position: absolute;
+  z-index: 2;
+  bottom: 5px;
+  left: 5px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0 0 0 1px;
+  background: rgb(14 14 15 / 78%);
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: var(--r-md);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 24%);
+  color: rgb(250 250 250 / 92%);
+}
+
+.attachment-preview__remove {
+  position: absolute;
+  z-index: 1;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: rgb(16 16 17 / 86%);
+  border: 1px solid rgb(255 255 255 / 12%);
+  border-radius: var(--r-md);
+  color: rgb(250 250 250 / 88%);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+
+.attachment-preview__remove:hover {
+  background: rgb(38 38 40 / 94%);
+}
+
+.attachment-preview__loading {
+  position: absolute;
+  z-index: 1;
+  right: 8px;
+  bottom: 8px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  border-top-color: #fff;
+  border-radius: var(--r-circle);
+  animation: spin 700ms linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .attachment-preview__loading {
+    animation: none;
+  }
+}
+
+.chip__x {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  flex: none;
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.chip__x:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px 8px;
+  /* Never wraps. Send has to stay on the row at every width, so the labels in
+     the middle shrink and truncate instead. */
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.tools > * {
+  min-width: 0;
+}
+
+/* In a narrow composer only the model name gives way. */
+.tools > .composer__add,
+.tools > .composer__dictation-options:not([data-hidden]),
+.model-selector__trigger-model > svg {
+  flex-shrink: 0;
+}
+
+@container chat-stage (max-width: 420px) {
+  .model-selector__trigger-level + .model-selector__trigger-effort {
+    display: none;
+  }
+}
+
+.tool span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool--compact span {
+  text-transform: capitalize;
+}
+
+.composer__dictation-options-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: max-content;
+}
+
+.tools__spacer {
+  flex: 1;
+}
+
+.context-usage {
+  position: relative;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  place-items: center;
+  border-radius: var(--r-circle);
+  outline: none;
+}
+
+.context-usage svg {
+  width: 24px;
+  height: 24px;
+  overflow: visible;
+  transform: rotate(-90deg);
+}
+
+.context-usage circle {
+  fill: none;
+  stroke-width: 2.25;
+}
+
+.context-usage__track {
+  stroke: var(--line-strong);
+}
+
+.context-usage__fill {
+  stroke: var(--text-2);
+  stroke-linecap: round;
+  stroke-dasharray: var(--context-used) 100;
+  /* --dur-med does not exist: the ring used to snap between percentages. */
+  transition: stroke-dasharray var(--dur-slow) var(--ease-out);
+}
+
+.context-usage__tooltip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  z-index: 40;
+  display: grid;
+  width: max-content;
+  max-width: 190px;
+  gap: 1px;
+  padding: 5px 8px;
+  background: var(--surface-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-flyout);
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 90ms var(--ease-out);
+}
+
+.context-usage__tooltip strong {
+  color: var(--text);
+  font-size: var(--t-sm);
+  font-weight: 550;
+}
+
+.context-usage:focus-visible .context-usage__tooltip {
+  opacity: 1;
+  transition: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .context-usage:hover .context-usage__tooltip {
+    opacity: 1;
+    transition-duration: 140ms;
+  }
+}
+
+.tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  white-space: nowrap;
+}
+
+.tool svg {
+  color: var(--text-3);
+  flex: none;
+}
+
+.tool--review,
+.tool--review svg {
+  color: var(--composer-review);
+}
+
+.tool--danger,
+.tool--danger svg {
+  color: var(--composer-danger);
+}
+
+.tool__sub {
+  color: var(--text-3);
+}
+
+.tool--full {
+  color: var(--error);
+}
+
+.tool--full svg {
+  color: var(--error);
+}
+
+.tool--quiet {
+  color: var(--text-3);
+  padding: 0 8px;
+  /* Roughly the model selector's width, so the shelf does not shuffle
+     sideways when the real control replaces this on every app start. */
+  min-width: 148px;
+}
+
+.tool--icon {
+  gap: 0;
+}
+
+.tool--icon svg {
+  color: var(--text-2);
+}
+
+.composer__design-beam {
+  display: block;
+  width: 100%;
+  border-radius: var(--r-composer);
+  --beam-stroke-opacity: var(--composer-design-beam-stroke-strength);
+  --beam-inner-opacity: var(--composer-design-beam-inner-strength);
+  --beam-bloom-opacity: var(--composer-design-beam-bloom-strength);
+}
+
+.composer__design-beam[data-active]::after,
+.composer__design-beam[data-active] [data-beam-bloom] {
+  padding: 2px !important;
+}
+
+:root[data-theme='light']
+  .composer__design-beam:is([data-active], [data-fading])
+  .composer__prompt {
+  border-color: var(--composer-design-prompt-border);
+}
+
+.composer__design-button-beam {
+  display: flex;
+  flex: none;
+  border-radius: var(--r-xl);
+}
+
+/* Scoped like the hover rule below: the later generic .menutrigger
+   { border: 0 } ties an unscoped selector on specificity and wins, which
+   zeroed this border out entirely — only the inset top highlight survived. */
+.tools
+  :is(
+    .composer__add,
+    .composer__permission,
+    .composer__design,
+    .menutrigger--model-selector,
+    .composer-voice-button
+  ) {
+  /* Composer controls use the same flat surfaces in every theme. */
+  background: var(--composer-control-bg);
+  border: 1px solid var(--composer-control-border);
+  box-shadow: var(--composer-control-shadow);
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.tools
+  :is(
+    .composer__add,
+    .composer__permission,
+    .composer__design,
+    .menutrigger--model-selector,
+    .composer-voice-button
+  ) {
+  background: var(--composer-action-bg);
+  border-color: var(--composer-action-border);
+  box-shadow: var(--composer-action-shadow);
+}
+
+/* Scoped under .tools so these outrank the later generic .menutrigger
+   radius/padding, which ties on bare class specificity and would win. */
+.tools .composer__add {
+  width: 32px;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  border-radius: var(--r-xl);
+}
+
+.tools :is(.composer__permission, .composer__design) {
+  min-height: 32px;
+  padding: 4px 11px;
+  border-radius: var(--r-xl);
+}
+
+.tools .composer__permission .tool,
+.tools .composer__design {
+  font-size: var(--t-md);
+}
+
+.tools .menutrigger--model-selector {
+  min-height: 32px;
+  padding: 4px 12px;
+  border-radius: var(--r-xl);
+}
+
+.composer-voice-button {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-circle);
+}
+
+.tools :is(.composer__add, .composer__permission) .tool:not(.tool--review):not(.tool--danger),
+.tools :is(.composer__add, .composer__permission) .tool:not(.tool--review):not(.tool--danger) svg,
+.tools .composer__design:not(.is-active),
+.tools .composer__design:not(.is-active) svg {
+  color: color-mix(in srgb, var(--text) 55%, var(--text-2));
+}
+
+.tools .composer__design.is-active {
+  background: var(--composer-design-active-bg);
+  border-color: var(--composer-design-border-active);
+  color: var(--text);
+}
+
+.tools .composer__design.is-active svg {
+  color: var(--text);
+}
+
+.composer__design:focus-visible > span {
+  background: linear-gradient(90deg, #b9a7ff, #87c7d8, #e2a6bc, #b9a7ff);
+  background-clip: text;
+  background-size: 200% 100%;
+  color: transparent;
+  animation: design-label-shimmer 2.4s linear infinite;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .composer__design:hover > span {
+    background: linear-gradient(90deg, #b9a7ff, #87c7d8, #e2a6bc, #b9a7ff);
+    background-clip: text;
+    background-size: 200% 100%;
+    color: transparent;
+    animation: design-label-shimmer 2.4s linear infinite;
+  }
+}
+
+@keyframes design-label-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :is(.composer__design-beam, .composer__design-button-beam)::before,
+  :is(.composer__design-beam, .composer__design-button-beam)::after,
+  :is(.composer__design-beam, .composer__design-button-beam) [data-beam-bloom] {
+    animation: none !important;
+  }
+}
+
+/* ---------- menus ---------- */
+
+.menuwrap {
+  position: relative;
+}
+
+.menutrigger {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 5px 8px;
+}
+
+.menutrigger:hover:not(:disabled) {
+  background: var(--control-hover);
+}
+
+.menutrigger:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.menu {
+  position: fixed;
+  /* Menus must sit above their modal owners: settings (60) and palette (70). */
+  z-index: 80;
+  min-width: min(260px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  max-height: min(340px, calc(100vh - 16px));
+  display: grid;
+  gap: 0;
+  overflow-y: auto;
+  padding: 3px;
+  background: var(--menu-bg);
+  border: 1px solid var(--menu-line);
+  border-radius: var(--r-popup);
+  box-shadow: var(--shadow-flyout);
+}
+
+.menu--settings {
+  /* Flush with the account trigger, whose width Menu publishes; the fallback
+     covers the first frame, and min-width: 0 beats the base .menu minimum. */
+  min-width: 0;
+  width: min(var(--menu-trigger-w, 224px), calc(100vw - 16px));
+  max-height: min(500px, calc(100vh - 24px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.menu--compact {
+  gap: 0;
+  padding: 3px;
+  border-radius: var(--r-lg);
+}
+
+.menu--project-picker {
+  min-width: 0;
+  width: min(240px, calc(100vw - 16px));
+}
+
+.menu--permissions {
+  min-width: 0;
+  width: min(240px, calc(100vw - 16px));
+}
+
+.menu--compact .menu__item {
+  padding: 4px 7px;
+  border-radius: var(--r-md);
+}
+
+.menu--settings .menu__item {
+  padding: 4px 6px;
+}
+
+.menu--compact .menu__name {
+  font-size: var(--t-sm);
+  line-height: 1.25;
+}
+
+.menu--compact .menu__label {
+  gap: 6px;
+}
+
+.menu--compact .menu__label > svg {
+  width: 13px;
+  height: 13px;
+}
+
+.menu--compact .menu__desc {
+  margin-top: 1px;
+  line-height: 1.25;
+}
+
+.menu--sidebar {
+  min-width: min(210px, calc(100vw - 16px));
+}
+
+.menu--sidebar .menu__item {
+  padding-block: 6px;
+}
+
+.menu__item--danger,
+.menu__item--danger .menu__name svg {
+  color: var(--error);
+}
+
+.menu__rule {
+  height: 1px;
+  background: var(--menu-line);
+  margin: 4px 2px;
+}
+
+.menu__group {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  margin: 2px 0 2px;
+  padding: 0 9px;
+}
+
+.menu__item {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-popup-item);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  padding: 4px 7px;
+  text-align: left;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.menu__item:not(:disabled):hover {
+  background: var(--menu-hover);
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.menu__item:not(:disabled):focus-visible {
+  background: var(--menu-hover);
+  box-shadow: none;
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-inset);
+}
+
+.menu__item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.menu .menu__item--danger:not(:disabled):is(:hover, :focus-visible) {
+  background: color-mix(in oklab, var(--error) 12%, transparent);
+  border-color: color-mix(in oklab, var(--error) 32%, var(--chrome-border));
+}
+
+.menu__name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: var(--t-sm);
+  line-height: 1.25;
+}
+
+.menu__name svg {
+  color: var(--text-3);
+}
+
+.menu__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.menu__label > svg {
+  flex: none;
+}
+
+.menu--project-picker .menu__label > span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer__permission-option--auto-review .menu__label,
+.composer__permission-option--auto-review .menu__label > svg {
+  color: var(--composer-review);
+}
+
+.composer__permission-option--full .menu__label,
+.composer__permission-option--full .menu__label > svg {
+  color: var(--composer-danger);
+}
+
+.menu__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.menu__desc {
+  display: block;
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- selects ---------- */
+
+.app-select {
+  position: relative;
+  min-width: 0;
+}
+
+.app-select__trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 7px;
+  background: var(--bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--chrome-inset-shadow);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.app-select__trigger:is(:hover, :focus-visible),
+.app-select.is-open .app-select__trigger {
+  border-color: color-mix(in srgb, var(--text-3) 55%, var(--chrome-border));
+  color: var(--text);
+}
+
+.app-select__trigger:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.app-select__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-select__chevron {
+  flex: none;
+  color: var(--text-3);
+}
+
+.app-select__listbox {
+  --r-popup: var(--r-lg);
+
+  position: fixed;
+  z-index: 90;
+  display: grid;
+  gap: 0;
+  width: max-content;
+  min-width: min(var(--app-select-trigger-w, 140px), calc(100vw - 16px));
+  max-width: min(280px, calc(100vw - 16px));
+  max-height: min(280px, calc(100vh - 16px));
+  overflow-y: auto;
+  padding: 3px;
+  background: var(--menu-bg);
+  border: 1px solid var(--menu-line);
+  border-radius: var(--r-popup);
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 8%),
+    0 6px 18px -14px rgb(0 0 0 / 35%);
+}
+
+/* A searchable picker is typed into where its value stands: while open, a
+   field takes the value's place in the trigger, and the panel below holds only
+   the options, at one size while it filters. */
+.app-select.is-searching .app-select__value {
+  visibility: hidden;
+}
+
+.app-select__query {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  min-width: 0;
+  padding: 0 28px 0 8px;
+  background: none;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  letter-spacing: inherit;
+  outline: 0;
+  appearance: none;
+}
+
+.app-select__query::placeholder {
+  color: var(--text-3);
+  opacity: 1;
+}
+
+.app-select__query::-webkit-search-cancel-button,
+.app-select__query::-webkit-search-decoration {
+  display: none;
+  appearance: none;
+}
+
+.app-select__listbox--search {
+  width: max(var(--app-select-trigger-w, 0px), 264px);
+  max-width: calc(100vw - 16px);
+  max-height: none;
+  overflow: hidden;
+  padding: 0;
+}
+
+.app-select__options {
+  display: grid;
+  align-content: start;
+}
+
+.app-select__listbox--search .app-select__options {
+  flex: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+  scroll-padding-block: 4px;
+}
+
+.app-select__group {
+  display: flex;
+  align-items: flex-end;
+  height: 26px;
+  padding: 0 8px 4px;
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  font-weight: 500;
+}
+
+.app-select__empty {
+  margin: 0;
+  padding: 8px 7px;
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  text-align: center;
+}
+
+.app-select__listbox--search .app-select__options:has(> .app-select__empty) {
+  align-content: center;
+}
+
+.app-select__listbox--search .app-select__empty {
+  padding: 8px;
+  font-size: var(--t-sm);
+}
+
+.app-select__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 27px;
+  padding: 3px 7px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-popup-item);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.app-select__option > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* One highlight: the pointer moves the active option, so hover needs no style of its own. */
+.app-select__option:not([aria-disabled='true']).is-active {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.app-select__option.is-selected {
+  color: var(--text);
+}
+
+.app-select__option > svg {
+  flex: none;
+  color: var(--text-2);
+}
+
+.app-select__option[aria-disabled='true'] {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.app-select__listbox--search .app-select__option {
+  align-items: baseline;
+  height: 28px;
+  min-height: 0;
+  padding: 0 8px;
+  line-height: 28px;
+  transition: none;
+}
+
+.app-select__listbox--search .app-select__option > svg {
+  align-self: center;
+}
+
+/* A font option carries a sample of itself, set in that font, before the check. */
+.app-select__option[data-sample]::after {
+  order: 1;
+  flex: none;
+  margin-left: auto;
+  color: var(--text-3);
+  content: 'Ag';
+  font-family: var(--app-select-sample);
+  font-size: 15px;
+}
+
+.app-select__option[data-sample] > span {
+  flex: 1;
+}
+
+.app-select__option[data-sample] > svg {
+  order: 2;
+}
+
+.app-select__option[data-sample]:not(.is-selected) {
+  padding-right: 31px;
+}
+
+.app-select__option[data-sample].is-active::after {
+  color: var(--text-2);
+}
+
+/* Offscreen rows skip layout and painting, so a long font list opens without
+   loading every face at once. */
+.app-select__listbox--search .app-select__option[data-sample] {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 28px;
+}
+
+/* ---------- buttons ---------- */
+
+.btn {
+  background: var(--light);
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--on-light);
+  cursor: pointer;
+  font: inherit;
+  min-height: 28px;
+  font-size: var(--t-sm);
+  font-weight: 500;
+  padding: 4px 10px;
+}
+
+.btn:disabled {
+  opacity: 0.28;
+  cursor: default;
+}
+
+.ghost {
+  background: none;
+  border: 0;
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+  padding: 4px 8px;
+  border-radius: var(--r-md);
+}
+
+.ghost:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  cursor: pointer;
+  flex: none;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.icon-btn.titlebar__toggle {
+  border-radius: var(--r-md);
+}
+
+.icon-btn.composer-voice-button {
+  width: 32px;
+  height: 32px;
+  margin-left: 2px;
+  background: none;
+  border: 0;
+  border-radius: var(--r-circle);
+  box-shadow: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .shelf-control:hover:not(:disabled) {
+    color: var(--text);
+  }
+
+  /* Composer controls keep their own hover surface and border. */
+  .tools
+    :is(
+      .composer__add,
+      .composer__permission,
+      .composer__design,
+      .menutrigger--model-selector,
+      .composer-voice-button
+    ):hover:not(:disabled) {
+    background: var(--composer-control-bg-hover);
+    border-color: var(--composer-control-border-hover);
+    box-shadow: var(--composer-control-shadow-hover);
+  }
+
+  .tools
+    :is(
+      .composer__add,
+      .composer__permission,
+      .composer__design,
+      .menutrigger--model-selector,
+      .composer-voice-button
+    ):hover:not(:disabled) {
+    background: var(--composer-action-bg-hover);
+    border-color: var(--composer-action-border-hover);
+    box-shadow: var(--composer-action-shadow-hover);
+  }
+
+  .tools .composer__design:hover:not(:disabled) {
+    border-color: var(--composer-design-border-hover);
+  }
+
+  .tools .composer__design.is-active:hover:not(:disabled) {
+    background: var(--composer-design-active-bg);
+    border-color: var(--composer-design-border-active);
+  }
+
+  .tools
+    :is(.composer__add, .composer__permission):hover:not(:disabled)
+    :is(
+      .tool:not(.tool--review):not(.tool--danger),
+      .tool:not(.tool--review):not(.tool--danger) svg
+    ) {
+    color: var(--text);
+  }
+}
+
+.icon-btn:hover,
+.icon-btn:focus-visible {
+  background: var(--surface-2);
+  color: var(--text);
+  opacity: 1;
+}
+
+.tools .icon-btn.composer-voice-button:is(:hover, :focus-visible) {
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* Some icon buttons are the only affordance in their row, so they cannot be
+   hover-revealed like the ones that sit beside a label. */
+.icon-btn--always {
+  opacity: 1;
+}
+
+.composer__send-beam {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  margin-left: 2px;
+  border-radius: var(--r-circle);
+}
+
+.orb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  background: var(--composer-orb);
+  border: 0;
+  border-radius: var(--r-circle);
+  color: var(--composer-on-orb);
+  cursor: pointer;
+  overflow: hidden;
+  transition:
+    background 150ms var(--ease-out),
+    box-shadow 150ms var(--ease-out),
+    color 150ms var(--ease-out);
+}
+
+.orb:not(.orb--stop) {
+  background: color-mix(in srgb, var(--composer-orb) 90%, transparent);
+  box-shadow: none;
+}
+
+.orb:disabled {
+  background: var(--surface-3);
+  box-shadow: none;
+  color: var(--text-3);
+  cursor: default;
+}
+
+.orb--stop {
+  background: var(--composer-stop);
+  color: var(--composer-on-orb);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .orb:hover:not(:disabled):not(.orb--stop) {
+    background: var(--composer-orb);
+  }
+
+  /* Stop was the one control in the composer that ignored the pointer: every
+     hover rule above excludes it. A brake with no hover state reads as dead. */
+  .orb--stop:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--composer-stop) 82%, var(--text));
+  }
+}
+
+/* Sent, not yet acknowledged. Some providers take a moment to unwind, and
+   without a visible pending state people press Stop again and again. */
+.orb--stop.is-stopping {
+  background: color-mix(in srgb, var(--composer-stop) 55%, var(--surface-3));
+  cursor: default;
+  transform: none;
+}
+
+.orb--stop.is-stopping .orb__stop-glyph {
+  /* ease-in-out is not one of our tokens; an unresolvable var() inside a
+     shorthand invalidates the whole declaration, so this pulse never ran. */
+  animation: orb-stopping 900ms var(--ease-out) infinite;
+}
+
+@keyframes orb-stopping {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.86);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb {
+    transition:
+      background-color var(--dur-press) var(--ease-out),
+      box-shadow var(--dur-press) var(--ease-out),
+      color var(--dur-press) var(--ease-out) !important;
+  }
+
+  .orb:hover:not(:disabled):not(.orb--stop),
+  .orb--stop:hover:not(:disabled) {
+    transform: none !important;
+  }
+
+  .spinner,
+  .orb--stop.is-stopping .orb__stop-glyph {
+    animation: none !important;
+  }
+}
+
+/* ---------- spinner ---------- */
+
+.spinner {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  color: var(--text-2);
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- empty & notice ---------- */
+
+@container chat-stage (max-width: 620px) {
+  .tools {
+    gap: 4px;
+    padding-inline: 6px;
+  }
+
+  .tools .composer__permission,
+  .tools .composer__design-button-beam {
+    width: 34px;
+  }
+
+  .tools .composer__permission,
+  .tools .composer__design {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .tools .composer__design {
+    width: 100%;
+  }
+
+  /* The permission icon is an IconMorph span, so only the label goes. */
+  .composer__permission .tool > span:not(.icon-morph),
+  .composer__design > span {
+    display: none;
+  }
+}
+
+@container chat-stage (max-width: 480px) {
+  .thread__col {
+    padding-inline: 14px;
+  }
+
+  .composer {
+    padding-inline: 10px;
+  }
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  min-height: 0;
+  min-width: 0;
+  padding: 24px;
+}
+
+.thread__empty {
+  position: absolute;
+  inset: 0;
+}
+
+.empty__prompt {
+  color: var(--text);
+  font-size: clamp(var(--t-xl), 2.4vw, 30px);
+  font-weight: 400;
+  letter-spacing: -0.035em;
+  line-height: 1.12;
+  margin: 0;
+  max-width: 100%;
+  text-align: center;
+}
+
+.empty__detail {
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  margin: -6px 0 0;
+  max-width: min(46ch, 100%);
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.notice {
+  position: fixed;
+  /* Above every modal surface (settings 60, palette 70, image viewer 100) —
+     an error raised while one of them is open must still be visible. */
+  z-index: 110;
+  /* Set while a composer is docked (NoticePresence). */
+  bottom: var(--notice-bottom, 18px);
+  right: var(--notice-right, 18px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 36px));
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg);
+  padding: 9px 10px;
+  font-size: var(--t-sm);
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+@starting-style {
+  .notice[data-state='open'] {
+    opacity: 0;
+    transform: translateY(4px) scale(0.97);
+  }
+}
+
+.notice[data-state='closing'] {
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px) scale(0.97);
+  transition-duration: var(--dur-press);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bottom-terminal {
+    transform: none;
+    transition: none;
+  }
+
+  .notice {
+    transform: none !important;
+    transition: opacity var(--dur-fast) var(--ease-out) !important;
+  }
+
+  @starting-style {
+    .notice[data-state='open'] {
+      opacity: 0;
+      transform: none;
+    }
+  }
+
+  .notice[data-state='closing'] {
+    opacity: 0;
+    transform: none !important;
+    transition-duration: var(--dur-press) !important;
+  }
+}
+
+/* Sits above the error toast so the two never overlap when both are up. */
+.notice--offline {
+  bottom: 62px;
+  border-color: color-mix(in srgb, var(--attention) 55%, var(--line-strong));
+  color: var(--text-2);
+}
+
+@media (max-width: 700px) {
+  .notice {
+    right: var(--notice-right, 12px);
+    bottom: var(--notice-bottom, 12px);
+    max-width: calc(100vw - 24px);
+  }
+
+  .notice--offline {
+    bottom: 56px;
+  }
+}
+
+.notice__text {
+  /* Server error messages are the point of this toast; clamping to three
+     lines beats truncating them to an unreadable single one. */
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.provider-update-spinner {
+  animation: spin 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .provider-update-spinner {
+    animation: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .shell {
+    /* Match the grid row to the 44px touch titlebar so it cannot overlap the drawer. */
+    --titlebar-h: 44px;
+  }
+
+  .shell__body {
+    grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  .rail-slot {
+    z-index: 20;
+  }
+
+  .rail__resize {
+    display: none;
+  }
+
+  .rail-slot .rail {
+    position: absolute;
+    z-index: 1;
+    inset: 0 auto 0 0;
+    width: min(86vw, 320px);
+  }
+
+  .rail__backdrop {
+    display: block;
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 100vw;
+    border: 0;
+    padding: 0;
+    background: transparent;
+  }
+
+  .rail-slot.is-collapsed .rail {
+    width: min(86vw, 320px);
+  }
+
+  .titlebar {
+    min-height: 44px;
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-right: max(12px, env(safe-area-inset-right));
+  }
+
+  .titlebar__toggle {
+    width: 34px;
+    height: 34px;
+  }
+
+  .titlebar__actions {
+    right: max(12px, env(safe-area-inset-right));
+  }
+
+  .titlebar__actions .titlebar__toggle {
+    width: 34px;
+    height: 34px;
+  }
+
+  .titlebar__actions .titlebar__workspace-expand {
+    width: 34px;
+  }
+
+  .stagehead {
+    min-height: 44px;
+    padding-inline: 12px 8px;
+  }
+
+  .thread__col {
+    padding: 0 14px;
+  }
+
+  .composer {
+    padding: 4px 10px max(8px, env(safe-area-inset-bottom));
+  }
+
+  .composer:not(.is-new-session) {
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
+  .composer textarea {
+    font-size: 16px;
+  }
+
+  .tools .composer__add,
+  .composer-voice-button {
+    width: 34px;
+    height: 34px;
+  }
+
+  .tools :is(.composer__permission, .composer__design),
+  .tools .menutrigger--model-selector {
+    min-height: 34px;
+  }
+
+  .composer__send-beam,
+  .orb {
+    width: 30px;
+    height: 30px;
+  }
+
+  /* Keep phone controls on one line: truncate the model name and pin Send right. */
+  .tools {
+    flex-wrap: nowrap;
+  }
+
+  .tools__spacer {
+    display: none;
+  }
+
+  .composer__send-beam {
+    flex: none;
+    margin-left: auto;
+  }
+
+  /* The near-full-width panel must not inherit the desktop -28px offset,
+     which would shove its left edge off a phone screen. */
+  .model-selector__menu {
+    translate: none;
+  }
+
+  /* On short viewports (landscape phones) the fixed 246px catalog plus the
+     controls would exceed the panel's max-height and clip. Let the list
+     shrink instead — it scrolls. */
+  .model-selector__catalog {
+    height: min(246px, 42vh);
+    height: min(246px, 42dvh);
+  }
+
+  /* Touch layouts keep row actions permanently visible. Reserve their two
+     22px targets so neither the source identity nor the title sits under the
+     absolute action layer at the rail's 240px minimum. */
+  .sessrow .sess {
+    padding-right: 56px;
+  }
+
+  .sessrow .sess__actions,
+  .proj__head .dots {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .sheet {
+    padding: 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  /* Below this width the pill labels cannot sit next to the model picker
+     and still fit one line. Keep the icons (their aria-labels stay intact)
+     so the whole rail reads left to right at any phone width. */
+  .tools .composer__permission .tool > span:not(.icon-morph),
+  .tools .composer__design > span {
+    display: none;
+  }
+
+  .tools :is(.composer__permission, .composer__design) {
+    padding: 5px 9px;
+  }
+}
+
+/* Translucent sidebar strength: --rail-glass (0..0.6), set in Appearance. */
+
+:root[data-glass='on'] .rail {
+  /* A thinner pane per strength step, plus a hairline edge highlight. What
+     shows through is the OS blur material behind the window (see below) —
+     never a painted gradient. */
+  background: color-mix(
+    in srgb,
+    var(--bg-rail-tint) calc(100% - var(--rail-glass, 0) * var(--rail-glass-fade, 130%)),
+    transparent
+  );
+  backdrop-filter: blur(26px) saturate(1.4);
+  -webkit-backdrop-filter: blur(26px) saturate(1.4);
+}
+
+/* The collapsed rail is a flyout over live app content, not a window-edge
+   material. Keeping its full-height backdrop blur while translating it made
+   every reveal repaint the thread and left the pane too clear to read. */
+:root[data-glass='on'] .rail-slot.is-collapsed .rail {
+  background: var(--bg-rail);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Light chrome is deliberately opaque. Its exact colour must not depend on
+   the OS material or the glass strength. */
+:root[data-theme='light'][data-glass='on'] .rail {
+  background: color-mix(
+    in srgb,
+    var(--bg-rail-tint) calc(100% - var(--rail-glass, 0) * var(--rail-glass-fade, 20%)),
+    transparent
+  );
+}
+
+/* The stage's rounded top-left corner exposes its parent. Paint that backing
+   layer too, otherwise the transparent desktop window leaves a dark wedge. */
+:root[data-theme='light'][data-glass='on'][data-shell='desktop'] .shell__body {
+  background: var(--bg-rail-tint);
+}
+
+/* Desktop acrylic/vibrancy shows through the sidebar; other columns stay opaque.
+   Browsers keep the tinted rail because they have no native material. */
+:root[data-glass='on'][data-shell='desktop']:not([data-theme='light']) body {
+  background: transparent;
+}
+
+:root[data-glass='on'][data-shell='desktop']:not([data-theme='light'])
+  .shell__body
+  > :not(.rail-slot) {
+  background: var(--bg);
+}

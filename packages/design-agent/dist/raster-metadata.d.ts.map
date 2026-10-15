@@ -1,0 +1,1 @@
+{"version":3,"file":"raster-metadata.d.ts","sourceRoot":"","sources":["../src/raster-metadata.ts"],"names":[],"mappings":"AAIA,UAAU,cAAc;IACtB,MAAM,EAAE,KAAK,GAAG,MAAM,GAAG,MAAM,GAAG,KAAK,CAAA;IACvC,KAAK,EAAE,MAAM,CAAA;IACb,MAAM,EAAE,MAAM,CAAA;CACf;AAED,wBAAgB,kBAAkB,CAAC,QAAQ,EAAE,MAAM,GAAG,cAAc,CAuEnE"}

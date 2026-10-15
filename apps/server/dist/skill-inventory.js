@@ -1,0 +1,163 @@
+import { readdir, readFile, stat } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+export const LOCAL_SKILL_CAPABILITIES = {
+    inventory: true,
+    configure: false,
+    install: false,
+};
+export function userSkillsDir(home = os.homedir()) {
+    return path.join(home, '.agents', 'skills');
+}
+export function projectSkillsDir(projectPath) {
+    return path.join(projectPath, '.agents', 'skills');
+}
+export async function listLocalSkills(projectPath, options = {}) {
+    const roots = [
+        { dir: projectSkillsDir(projectPath), scope: 'project' },
+        { dir: options.userSkillsDir ?? userSkillsDir(), scope: 'user' },
+    ];
+    const skills = [];
+    const errors = [];
+    const seen = new Set();
+    for (const root of roots) {
+        const listed = await listSkillsIn(root.dir, root.scope);
+        errors.push(...listed.errors);
+        for (const skill of listed.skills) {
+            const key = skillKey(skill);
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            skills.push(skill);
+        }
+    }
+    return { skills, errors };
+}
+export function mergeSkills(primary, extra) {
+    const seen = new Set(primary.map(skillKey));
+    const merged = [...primary];
+    for (const skill of extra) {
+        const key = skillKey(skill);
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        merged.push(skill);
+    }
+    return merged;
+}
+async function listSkillsIn(root, scope) {
+    const skills = [];
+    const errors = [];
+    let entries;
+    try {
+        entries = await readdir(root);
+    }
+    catch (error) {
+        if (isMissing(error))
+            return { skills, errors };
+        errors.push({ path: root, message: message(error) });
+        return { skills, errors };
+    }
+    for (const entry of entries) {
+        if (entry.startsWith('.'))
+            continue;
+        const dir = path.join(root, entry);
+        let info;
+        try {
+            info = await stat(dir);
+        }
+        catch (error) {
+            if (isMissing(error))
+                continue;
+            errors.push({ path: dir, message: message(error) });
+            continue;
+        }
+        if (!info.isDirectory())
+            continue;
+        const skillFile = path.join(dir, 'SKILL.md');
+        let markdown;
+        try {
+            const file = await stat(skillFile);
+            if (!file.isFile())
+                continue;
+            markdown = await readFile(skillFile, 'utf8');
+        }
+        catch (error) {
+            if (isMissing(error))
+                continue;
+            errors.push({ path: skillFile, message: message(error) });
+            continue;
+        }
+        const frontmatter = parseSkillFrontmatter(markdown);
+        const name = skillName(frontmatter.name, entry);
+        skills.push({
+            id: skillFile,
+            name,
+            description: frontmatter.description ?? '',
+            source: { type: 'folder', path: dir },
+            scope,
+            enabled: true,
+            dependencyErrors: [],
+        });
+    }
+    return { skills, errors };
+}
+function parseSkillFrontmatter(markdown) {
+    const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(markdown);
+    if (!match)
+        return {};
+    const fields = {};
+    let current;
+    for (const line of match[1].split(/\r?\n/)) {
+        // Agent Skills keys such as `allowed-tools` are hyphenated; every top-level key
+        // must end the previous field so its nested lines are not folded into it.
+        const field = /^([A-Za-z][\w-]*)\s*:\s*(.*?)\s*$/.exec(line);
+        if (field) {
+            current = field[1];
+            const value = field[2] ?? '';
+            // A block scalar indicator (`>-`, `|`, `|2+`) only introduces the indented lines.
+            fields[current] = /^[|>](?:[1-9]?[+-]?|[+-][1-9])$/.test(value) ? '' : unquote(value);
+            continue;
+        }
+        if (current && /^\s+\S/.test(line)) {
+            const next = line.trim();
+            const previous = fields[current];
+            fields[current] = previous ? `${previous} ${next}` : next;
+        }
+    }
+    const frontmatter = {};
+    if (fields.name)
+        frontmatter.name = fields.name;
+    if (fields.description)
+        frontmatter.description = fields.description;
+    return frontmatter;
+}
+function skillName(frontmatterName, folder) {
+    const candidate = frontmatterName?.trim() || folder;
+    return candidate.length > 0 ? candidate : folder;
+}
+function unquote(value) {
+    if (value.length >= 2) {
+        const start = value[0];
+        const end = value.at(-1);
+        if ((start === '"' && end === '"') || (start === "'" && end === "'")) {
+            return value.slice(1, -1);
+        }
+    }
+    return value;
+}
+function skillKey(skill) {
+    const identity = skill.source.type === 'folder' ? skill.source.path : skill.id;
+    const resolved = path.resolve(identity);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+function isMissing(error) {
+    return (typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'ENOENT');
+}
+function message(error) {
+    return error instanceof Error ? error.message : 'Skill folder could not be read';
+}
+//# sourceMappingURL=skill-inventory.js.map

@@ -1,0 +1,521 @@
+import { execFileSync } from 'node:child_process'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import {
+  readSessionDiff,
+  readWorkspaceDiff,
+  reviewDiffFile,
+  reviewDiffHunk,
+  reverseUnifiedDiff,
+  StaleDiffSnapshotError,
+} from './diff-review.js'
+import { SessionDiffSchema } from '@harness/contracts'
+import { Store } from './store.js'
+
+let repo: string
+let store: Store
+
+const lines = (replacements: Record<number, string> = {}) =>
+  Array.from({ length: 20 }, (_, index) => replacements[index + 1] ?? `line ${index + 1}`).join(
+    '\n',
+  ) + '\n'
+
+const git = (...args: string[]) =>
+  execFileSync('git', args, { cwd: repo, encoding: 'utf8', windowsHide: true })
+
+/**
+ * The patch a provider sends with absolute paths. One pass over the header
+ * lines only, so a temp root that itself contains "b/" is never rewritten.
+ */
+const absolutePatch = (patch: string) => {
+  const root = repo.replaceAll('\\', '/')
+  return patch.replace(/^(?:diff --git |--- |\+\+\+ ).*$/gm, (line) =>
+    line.replace(/(^|[\s"])([ab])\//g, (_, lead, side) => `${lead}${side}/${root}/`),
+  )
+}
+
+beforeEach(() => {
+  repo = mkdtempSync(path.join(os.tmpdir(), 'harness-diff-review-'))
+  execFileSync('git', ['init', '-b', 'main', repo], { windowsHide: true })
+  git('config', 'user.email', 'test@example.com')
+  git('config', 'user.name', 'Test')
+  git('config', 'core.autocrlf', 'false')
+  writeFileSync(path.join(repo, 'file.txt'), lines())
+  writeFileSync(path.join(repo, 'staged.txt'), 'original\n')
+  git('add', '.')
+  git('commit', '-m', 'base')
+
+  store = new Store(':memory:')
+  store.addProject(repo)
+  store.addThread({ id: 'thread-1', projectPath: repo, provider: 'codex', title: 'Review' })
+})
+
+afterEach(() => {
+  store.close()
+  rmSync(repo, { recursive: true, force: true })
+})
+
+describe('structured diff review', () => {
+  it('shows real hunks for a nested project and excludes sibling changes', async () => {
+    const nested = path.join(repo, 'nested project')
+    mkdirSync(nested)
+    writeFileSync(path.join(nested, '新 file.txt'), 'before\n')
+    git('add', '.')
+    git('commit', '-m', 'nested')
+    writeFileSync(path.join(nested, '新 file.txt'), 'after\n')
+    writeFileSync(path.join(repo, 'file.txt'), 'sibling edit\n')
+    const diff = await readWorkspaceDiff(nested)
+    expect(diff.files).toHaveLength(1)
+    expect(diff.files[0]?.path).toBe('nested project/新 file.txt')
+    expect(diff.files[0]?.hunks[0]?.lines).toContainEqual({
+      kind: 'addition',
+      newLine: 1,
+      text: 'after',
+    })
+  })
+  it('reads staged, unstaged and untracked work without a session review scope', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'unstaged work' }))
+    writeFileSync(path.join(repo, 'staged.txt'), 'staged work\n')
+    git('add', 'staged.txt')
+    writeFileSync(path.join(repo, 'untracked.txt'), 'untracked work\n')
+
+    const diff = await readWorkspaceDiff(repo)
+
+    expect(diff.threadId).toMatch(/^workspace-/)
+    expect(diff.files.map((file) => file.path)).toEqual(['file.txt', 'staged.txt', 'untracked.txt'])
+    expect(diff.files.find((file) => file.path === 'untracked.txt')).toMatchObject({
+      status: 'added',
+    })
+  })
+
+  it('keeps a deleted file apart from the folder that replaced it', async () => {
+    writeFileSync(path.join(repo, 'foo'), 'old foo\n')
+    git('add', '.')
+    git('commit', '-m', 'foo')
+    rmSync(path.join(repo, 'foo'))
+    mkdirSync(path.join(repo, 'foo'))
+    writeFileSync(path.join(repo, 'foo', 'bar.ts'), 'export const bar = 1\n')
+
+    const diff = await readWorkspaceDiff(repo)
+
+    expect(() => SessionDiffSchema.parse(diff)).not.toThrow()
+    expect(diff.files.map(({ path, status }) => ({ path, status }))).toEqual([
+      { path: 'foo', status: 'deleted' },
+      { path: 'foo/bar.ts', status: 'added' },
+    ])
+    expect(diff.files[0]?.hunks.flatMap((hunk) => hunk.lines)).toEqual([
+      { kind: 'deletion', oldLine: 1, text: 'old foo' },
+    ])
+  })
+
+  it('shows every file as added before the first commit', async () => {
+    const fresh = mkdtempSync(path.join(os.tmpdir(), 'harness-diff-unborn-'))
+    try {
+      execFileSync('git', ['init', '-b', 'main', fresh], { windowsHide: true })
+      writeFileSync(path.join(fresh, 'first.txt'), 'hello\n')
+
+      const diff = await readWorkspaceDiff(fresh)
+
+      expect(diff.files).toHaveLength(1)
+      expect(diff.files[0]).toMatchObject({ path: 'first.txt', status: 'added' })
+      expect(diff.files[0]?.hunks[0]?.lines).toContainEqual({
+        kind: 'addition',
+        newLine: 1,
+        text: 'hello',
+      })
+    } finally {
+      rmSync(fresh, { recursive: true, force: true })
+    }
+  })
+
+  it('parses separate hunks and remembers accepted work', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'accepted change', 18: 'later change' }))
+
+    const initial = await readSessionDiff(repo, 'thread-1', store)
+    const file = initial.files.find((entry) => entry.path === 'file.txt')!
+    expect(file.status).toBe('modified')
+    expect(file.hunks).toHaveLength(2)
+    expect(file.hunks[0]?.lines).toContainEqual({
+      kind: 'addition',
+      newLine: 2,
+      text: 'accepted change',
+    })
+
+    const reviewed = await reviewDiffHunk(
+      repo,
+      'thread-1',
+      initial.version,
+      file.path,
+      file.hunks[0]!.id,
+      'accept',
+      store,
+    )
+
+    expect(reviewed.version).toBe(initial.version)
+    expect(reviewed.files[0]?.hunks[0]?.decision).toBe('accept')
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toContain('accepted change')
+  })
+
+  it('keeps an accepted hunk reviewed after rejecting an earlier insertion', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), `inserted\n${lines({ 18: 'accepted change' })}`)
+
+    let diff = await readSessionDiff(repo, 'thread-1', store)
+    const file = diff.files.find((entry) => entry.path === 'file.txt')!
+    expect(file.hunks).toHaveLength(2)
+    const accepted = file.hunks[1]!
+    diff = await reviewDiffHunk(
+      repo,
+      'thread-1',
+      diff.version,
+      file.path,
+      accepted.id,
+      'accept',
+      store,
+    )
+    const first = diff.files[0]!.hunks[0]!
+    diff = await reviewDiffHunk(
+      repo,
+      'thread-1',
+      diff.version,
+      file.path,
+      first.id,
+      'reject',
+      store,
+    )
+
+    expect(diff.files[0]?.hunks[0]).toMatchObject({ id: accepted.id, decision: 'accept' })
+  }, 15_000)
+
+  it('stores reject as the latest hunk decision', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'review twice' }))
+
+    let diff = await readSessionDiff(repo, 'thread-1', store)
+    const file = diff.files[0]!
+    const hunk = file.hunks[0]!
+    diff = await reviewDiffHunk(repo, 'thread-1', diff.version, file.path, hunk.id, 'accept', store)
+    await reviewDiffHunk(repo, 'thread-1', diff.version, file.path, hunk.id, 'reject', store)
+    expect(store.diffDecision('thread-1', `hunk:${hunk.id}`)).toBe('reject')
+  }, 15_000)
+
+  it('stores reject as the latest file decision', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'review twice' }))
+
+    let diff = await readSessionDiff(repo, 'thread-1', store)
+    const file = diff.files[0]!
+    await reviewDiffFile(repo, 'thread-1', diff.version, file.path, 'accept', store)
+    diff = await reviewDiffFile(repo, 'thread-1', diff.version, file.path, 'reject', store)
+    expect(diff.files).toEqual([])
+
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'review twice' }))
+    expect((await readSessionDiff(repo, 'thread-1', store)).files[0]?.decision).toBe('reject')
+  }, 15_000)
+
+  it('rejects only one hunk without changing the index or unrelated work', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'reject me', 18: 'keep me' }))
+    writeFileSync(path.join(repo, 'staged.txt'), 'staged work\n')
+    git('add', 'staged.txt')
+    const indexBefore = git('diff', '--cached', '--binary')
+
+    const initial = await readSessionDiff(repo, 'thread-1', store)
+    const file = initial.files.find((entry) => entry.path === 'file.txt')!
+    await reviewDiffHunk(
+      repo,
+      'thread-1',
+      initial.version,
+      file.path,
+      file.hunks[0]!.id,
+      'reject',
+      store,
+    )
+
+    const content = readFileSync(path.join(repo, 'file.txt'), 'utf8')
+    expect(content).toContain('line 2')
+    expect(content).toContain('keep me')
+    expect(readFileSync(path.join(repo, 'staged.txt'), 'utf8')).toBe('staged work\n')
+    expect(git('diff', '--cached', '--binary')).toBe(indexBefore)
+  })
+
+  it('rejects a decision made against a stale worktree snapshot', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'first change' }))
+    const initial = await readSessionDiff(repo, 'thread-1', store)
+    const file = initial.files[0]!
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'changed again' }))
+
+    await expect(
+      reviewDiffHunk(
+        repo,
+        'thread-1',
+        initial.version,
+        file.path,
+        file.hunks[0]!.id,
+        'reject',
+        store,
+      ),
+    ).rejects.toBeInstanceOf(StaleDiffSnapshotError)
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toContain('changed again')
+  })
+
+  it('preserves CRLF while rejecting a text hunk', async () => {
+    writeFileSync(path.join(repo, '.gitattributes'), '*.crlf text eol=crlf\n')
+    writeFileSync(path.join(repo, 'windows.crlf'), 'one\r\ntwo\r\nthree\r\n')
+    git('add', '.')
+    git('commit', '-m', 'add crlf')
+    writeFileSync(path.join(repo, 'windows.crlf'), 'one\r\nchanged\r\nthree\r\n')
+
+    const initial = await readSessionDiff(repo, 'thread-1', store)
+    const file = initial.files.find((entry) => entry.path === 'windows.crlf')!
+    await reviewDiffHunk(
+      repo,
+      'thread-1',
+      initial.version,
+      file.path,
+      file.hunks[0]!.id,
+      'reject',
+      store,
+    )
+
+    expect(readFileSync(path.join(repo, 'windows.crlf'), 'utf8')).toBe('one\r\ntwo\r\nthree\r\n')
+  })
+
+  it('rejects changes when diff.noprefix is enabled', async () => {
+    git('config', 'diff.noprefix', 'true')
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'reject me' }))
+
+    const diff = await readSessionDiff(repo, 'thread-1', store)
+    const file = diff.files[0]!
+    await reviewDiffHunk(
+      repo,
+      'thread-1',
+      diff.version,
+      file.path,
+      file.hunks[0]!.id,
+      'reject',
+      store,
+    )
+
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe(lines())
+  })
+
+  it('does not invoke configured textconv drivers', async () => {
+    writeFileSync(path.join(repo, '.gitattributes'), 'file.txt diff=broken\n')
+    git('add', '.gitattributes')
+    git('commit', '-m', 'add diff driver')
+    git('config', 'diff.broken.textconv', 'missing-textconv-command')
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'reject me' }))
+
+    const diff = await readSessionDiff(repo, 'thread-1', store)
+    const file = diff.files.find((entry) => entry.path === 'file.txt')!
+    await reviewDiffHunk(
+      repo,
+      'thread-1',
+      diff.version,
+      file.path,
+      file.hunks[0]!.id,
+      'reject',
+      store,
+    )
+
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe(lines())
+  })
+
+  it('reviews binary changes and renames at file scope', async () => {
+    writeFileSync(path.join(repo, 'asset.bin'), Buffer.from([0, 1, 2, 3]))
+    writeFileSync(path.join(repo, 'old-name.txt'), lines())
+    git('add', '.')
+    git('commit', '-m', 'add files')
+    writeFileSync(path.join(repo, 'asset.bin'), Buffer.from([0, 9, 2, 3]))
+    renameSync(path.join(repo, 'old-name.txt'), path.join(repo, 'new-name.txt'))
+    writeFileSync(path.join(repo, 'new-name.txt'), lines({ 10: 'renamed edit' }))
+
+    let diff = await readSessionDiff(repo, 'thread-1', store)
+    const binary = diff.files.find((entry) => entry.path === 'asset.bin')!
+    expect(binary).toMatchObject({ binary: true, hunks: [] })
+    diff = await reviewDiffFile(repo, 'thread-1', diff.version, binary.path, 'reject', store)
+    expect(readFileSync(path.join(repo, 'asset.bin'))).toEqual(Buffer.from([0, 1, 2, 3]))
+
+    const renamed = diff.files.find((entry) => entry.path === 'new-name.txt')!
+    expect(renamed).toMatchObject({ status: 'renamed', previousPath: 'old-name.txt' })
+    await reviewDiffFile(repo, 'thread-1', diff.version, renamed.path, 'reject', store)
+    expect(existsSync(path.join(repo, 'old-name.txt'))).toBe(true)
+    expect(existsSync(path.join(repo, 'new-name.txt'))).toBe(false)
+  })
+
+  it('keeps a text file whose lines mention binary patch markers as text', async () => {
+    const notes = (edit: string) =>
+      `When git says "Binary files a and b differ"\nGIT binary patch\n${edit}\n`
+    writeFileSync(path.join(repo, 'notes.md'), notes('before'))
+    git('add', '.')
+    git('commit', '-m', 'notes')
+    writeFileSync(path.join(repo, 'notes.md'), notes('after'))
+
+    const diff = await readWorkspaceDiff(repo)
+
+    expect(diff.files).toHaveLength(1)
+    expect(diff.files[0]).toMatchObject({ path: 'notes.md', binary: false })
+    expect(diff.files[0]?.hunks).toHaveLength(1)
+  })
+
+  it('reverses an absolute provider patch without touching unrelated work', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'agent change' }))
+    const absolute = absolutePatch(git('diff', '--binary', '--no-color', '--', 'file.txt'))
+    writeFileSync(path.join(repo, 'unrelated.txt'), 'keep this\n')
+
+    await reverseUnifiedDiff(repo, absolute)
+
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe(lines())
+    expect(readFileSync(path.join(repo, 'unrelated.txt'), 'utf8')).toBe('keep this\n')
+  })
+
+  it.each(['space name.txt', 'quoted 文档.txt'])(
+    'normalizes absolute patch paths while preserving %s',
+    async (name) => {
+      writeFileSync(path.join(repo, name), 'before\n')
+      git('add', '--', name)
+      git('commit', '-m', 'named file')
+      writeFileSync(path.join(repo, name), 'after\n')
+      const patch = absolutePatch(git('diff', '--binary', '--no-color', '--', name))
+      await reverseUnifiedDiff(repo, patch)
+      expect(readFileSync(path.join(repo, name), 'utf8')).toBe('before\n')
+    },
+  )
+
+  it('reverses an imported Codex turn that joined its edits with blank lines', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'second edit' }))
+    writeFileSync(path.join(repo, 'staged.txt'), 'agent change\n')
+    const root = repo.replaceAll('\\', '/')
+    const edit = (file: string, hunk: string) =>
+      `diff --git a/${root}/${file} b/${root}/${file}\n--- a/${root}/${file}\n+++ b/${root}/${file}\n${hunk}`
+    const patch = [
+      edit('file.txt', '@@ -1,3 +1,3 @@\n line 1\n-line 2\n+first edit\n line 3\n'),
+      edit('staged.txt', '@@ -1 +1 @@\n-original\n+agent change\n'),
+      edit('file.txt', '@@ -1,3 +1,3 @@\n line 1\n-first edit\n+second edit\n line 3\n'),
+    ].join('\n')
+
+    await reverseUnifiedDiff(repo, patch)
+
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe(lines())
+    expect(readFileSync(path.join(repo, 'staged.txt'), 'utf8')).toBe('original\n')
+  })
+
+  it('keeps the blank line that ends a binary patch before the next file', async () => {
+    writeFileSync(path.join(repo, 'asset.bin'), Buffer.from([0, 1, 2, 3]))
+    git('add', 'asset.bin')
+    git('commit', '-m', 'binary')
+    writeFileSync(path.join(repo, 'asset.bin'), Buffer.from([0, 9, 2, 3]))
+    writeFileSync(path.join(repo, 'staged.txt'), 'agent change\n')
+    const patch = git('diff', '--binary', '--no-color')
+    expect(patch).toContain('\n\ndiff --git a/staged.txt')
+
+    await reverseUnifiedDiff(repo, patch)
+
+    expect(readFileSync(path.join(repo, 'asset.bin'))).toEqual(Buffer.from([0, 1, 2, 3]))
+    expect(readFileSync(path.join(repo, 'staged.txt'), 'utf8')).toBe('original\n')
+  })
+
+  it('keeps an empty context line that ends a hunk before the next file', async () => {
+    writeFileSync(path.join(repo, 'blank.txt'), 'x\ny\n\n')
+    git('add', 'blank.txt')
+    git('commit', '-m', 'blank line')
+    writeFileSync(path.join(repo, 'blank.txt'), 'x\nY\n\n')
+    writeFileSync(path.join(repo, 'staged.txt'), 'agent change\n')
+    const patch = git('-c', 'diff.suppressBlankEmpty=true', 'diff', '--no-color')
+    expect(patch).toContain('+Y\n\ndiff --git a/staged.txt')
+
+    await reverseUnifiedDiff(repo, patch)
+
+    expect(readFileSync(path.join(repo, 'blank.txt'), 'utf8')).toBe('x\ny\n\n')
+    expect(readFileSync(path.join(repo, 'staged.txt'), 'utf8')).toBe('original\n')
+  })
+
+  it('deletes a created file when an imported Codex patch has no mode lines', async () => {
+    writeFileSync(path.join(repo, 'new.txt'), 'fresh\n')
+    rmSync(path.join(repo, 'staged.txt'))
+    const root = repo.replaceAll('\\', '/')
+    const patch = [
+      `diff --git a/${root}/new.txt b/${root}/new.txt`,
+      '--- /dev/null',
+      `+++ b/${root}/new.txt`,
+      '@@ -0,0 +1,1 @@',
+      '+fresh',
+      `diff --git a/${root}/staged.txt b/${root}/staged.txt`,
+      `--- a/${root}/staged.txt`,
+      '+++ /dev/null',
+      '@@ -1,1 +0,0 @@',
+      '-original',
+      '',
+    ].join('\n')
+
+    await reverseUnifiedDiff(repo, patch)
+
+    expect(existsSync(path.join(repo, 'new.txt'))).toBe(false)
+    expect(existsSync(path.join(repo, 'dev'))).toBe(false)
+    expect(readFileSync(path.join(repo, 'staged.txt'), 'utf8')).toBe('original\n')
+  })
+
+  it('does not partially reverse a patch after one of its files changed again', async () => {
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'agent change' }))
+    writeFileSync(path.join(repo, 'staged.txt'), 'agent change\n')
+    const patch = git('diff', '--binary', '--no-color')
+    writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'newer user change' }))
+
+    await expect(reverseUnifiedDiff(repo, patch)).rejects.toThrow()
+
+    expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toContain('newer user change')
+    expect(readFileSync(path.join(repo, 'staged.txt'), 'utf8')).toBe('agent change\n')
+  })
+
+  it.each(['file', 'hunk'])(
+    'rejects a stale %s review after HEAD changes without changing files',
+    async (scope) => {
+      const base = git('rev-parse', 'HEAD').trim()
+      writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'new base' }))
+      git('add', 'file.txt')
+      git('commit', '-m', 'new base')
+      writeFileSync(path.join(repo, 'file.txt'), lines({ 2: 'working edit' }))
+      const diff = await readSessionDiff(repo, 'thread-1', store)
+      const file = diff.files[0]!
+      git('update-ref', 'HEAD', base)
+      const review =
+        scope === 'file'
+          ? reviewDiffFile(repo, 'thread-1', diff.version, file.path, 'reject', store)
+          : reviewDiffHunk(
+              repo,
+              'thread-1',
+              diff.version,
+              file.path,
+              file.hunks[0]!.id,
+              'reject',
+              store,
+            )
+      await expect(review).rejects.toBeInstanceOf(StaleDiffSnapshotError)
+      expect(readFileSync(path.join(repo, 'file.txt'), 'utf8')).toBe(lines({ 2: 'working edit' }))
+    },
+  )
+
+  it('does not strip repository-root text embedded inside a relative patch path', async () => {
+    const rootText = repo.replaceAll('\\', '/').replace(/^[A-Za-z]:/, '')
+    const relative = `x${rootText}/victim.txt`
+    const target = path.join(repo, relative)
+    mkdirSync(path.dirname(target), { recursive: true })
+    writeFileSync(target, 'before\n')
+    writeFileSync(path.join(repo, 'xvictim.txt'), 'before\n')
+    git('add', '.')
+    git('commit', '-m', 'matching relative path')
+    writeFileSync(target, 'after\n')
+    writeFileSync(path.join(repo, 'xvictim.txt'), 'after\n')
+    const patch = git('diff', '--binary', '--no-color', '--', relative)
+    await reverseUnifiedDiff(repo, patch)
+    expect(readFileSync(target, 'utf8')).toBe('before\n')
+    expect(readFileSync(path.join(repo, 'xvictim.txt'), 'utf8')).toBe('after\n')
+  })
+})

@@ -1,0 +1,46 @@
+{
+  "name": "@harness/adapter-codex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./capabilities": {
+      "types": "./dist/capabilities.d.ts",
+      "default": "./dist/capabilities.js"
+    },
+    "./auth": {
+      "types": "./dist/auth.d.ts",
+      "default": "./dist/auth.js"
+    },
+    "./voice": {
+      "types": "./dist/voice.d.ts",
+      "default": "./dist/voice.js"
+    },
+    "./updates": {
+      "types": "./dist/updates.d.ts",
+      "default": "./dist/updates.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "test": "vitest run --passWithNoTests",
+    "generate": "codex app-server generate-ts --out src/generated"
+  },
+  "dependencies": {
+    "@harness/contracts": "workspace:*",
+    "@harness/proc": "workspace:*",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

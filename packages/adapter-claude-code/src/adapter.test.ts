@@ -1,0 +1,1920 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import type {
+  ModelInfo,
+  McpServerConfig,
+  McpServerStatus,
+  Options,
+  SDKControlInitializeResponse,
+  SDKControlInterruptResponse,
+  SDKMessage,
+  SDKPartialAssistantMessage,
+  SDKUserMessage,
+} from '@anthropic-ai/claude-agent-sdk'
+import type { DomainEvent, Item } from '@harness/contracts'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  ClaudeCodeAdapter,
+  CLAUDE_CAPABILITIES,
+  CLAUDE_MODELS,
+  claudeUserMessage,
+} from './adapter.js'
+import type { ClaudeQueryFactory, ClaudeQueryRuntime } from './sdk-runtime.js'
+import { createClaudeMcpBootstrap } from './mcp-bootstrap.js'
+import { Store } from '../../../apps/server/src/store.js'
+import { reduce, emptyThread } from '../../../apps/web/src/thread-store.js'
+import { projectThreadItems } from '../../../apps/web/src/ui/turns.js'
+
+vi.mock('./mcp-bootstrap.js', async (original) => ({
+  ...(await original<typeof import('./mcp-bootstrap.js')>()),
+  createClaudeMcpBootstrap: vi.fn(async (ids: string[]) => ({
+    servers: Object.fromEntries(
+      ids.map((id) => [id, { type: 'http' as const, url: 'http://127.0.0.1:49152/bootstrap' }]),
+    ),
+    close: vi.fn(async () => {}),
+  })),
+}))
+
+class FakeQuery implements ClaudeQueryRuntime {
+  readonly #messages: SDKMessage[] = []
+  readonly #waiters: Array<(value: IteratorResult<SDKMessage>) => void> = []
+  readonly models: ModelInfo[]
+  closed = false
+  interrupts = 0
+  /** Async messages the CLI reports as surviving the next interrupt; older CLIs send none. */
+  stillQueued: string[] | undefined
+  readonly modelsSet: Array<string | undefined> = []
+  readonly permissionModes: string[] = []
+  readonly mcpConfigurations: Record<string, McpServerConfig>[] = []
+  mcpServers: Record<string, McpServerConfig>
+
+  constructor(models: ModelInfo[] = [], mcpServers: Record<string, McpServerConfig> = {}) {
+    this.models = models
+    this.mcpServers = mcpServers
+  }
+
+  emitMessage(message: SDKMessage): void {
+    const waiter = this.#waiters.shift()
+    if (waiter) waiter({ value: message, done: false })
+    else this.#messages.push(message)
+  }
+
+  close(): void {
+    this.closed = true
+    for (const waiter of this.#waiters.splice(0)) waiter({ value: undefined, done: true })
+  }
+
+  async interrupt(): Promise<SDKControlInterruptResponse | undefined> {
+    this.interrupts += 1
+    return this.stillQueued && { still_queued: this.stillQueued }
+  }
+
+  async setModel(model?: string): Promise<void> {
+    this.modelsSet.push(model)
+  }
+
+  async setPermissionMode(
+    mode: Parameters<ClaudeQueryRuntime['setPermissionMode']>[0],
+  ): Promise<void> {
+    this.permissionModes.push(mode)
+  }
+
+  async supportedModels(): Promise<ModelInfo[]> {
+    return this.models
+  }
+
+  async mcpServerStatus(): Promise<McpServerStatus[]> {
+    return Object.entries(this.mcpServers).map(([name, config]) => ({
+      name,
+      status: 'connected',
+      config,
+      tools: [],
+    }))
+  }
+
+  async setMcpServers(servers: Record<string, McpServerConfig>) {
+    this.mcpConfigurations.push(servers)
+    this.mcpServers = servers
+    return { added: Object.keys(servers), removed: [], errors: {} }
+  }
+
+  async initializationResult(): Promise<SDKControlInitializeResponse> {
+    return {
+      commands: [],
+      agents: [],
+      output_style: 'default',
+      available_output_styles: [],
+      models: this.models,
+      account: {},
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+    return {
+      next: () => {
+        const message = this.#messages.shift()
+        if (message) return Promise.resolve({ value: message, done: false })
+        if (this.closed) return Promise.resolve({ value: undefined, done: true })
+        return new Promise((resolve) => this.#waiters.push(resolve))
+      },
+    }
+  }
+}
+
+function harness(models: ModelInfo[] = []) {
+  const inputs: Array<{ prompt: AsyncIterable<SDKUserMessage>; options: Options }> = []
+  const queries: FakeQuery[] = []
+  const createQuery: ClaudeQueryFactory = (input) => {
+    inputs.push(input)
+    const query = new FakeQuery(models, input.options.mcpServers)
+    queries.push(query)
+    return query
+  }
+  return { createQuery, inputs, queries }
+}
+
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve))
+
+describe('Claude Agent SDK session', () => {
+  it.each([false, true])('detaches after an unexpected stream end (active: %s)', async (active) => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const disconnected = vi.fn(() => events.slice())
+    adapter.onDisconnected(disconnected)
+    const thread = await adapter.startThread('/repo')
+    if (active) await adapter.sendTurn(thread.id, 'Work')
+    fake.queries[0]!.close()
+    await tick()
+    expect(disconnected).toHaveBeenCalledOnce()
+    expect(events.filter((event) => event.type === 'turn.completed')).toHaveLength(active ? 1 : 0)
+    expect(disconnected.mock.results[0]!.value).toEqual(events)
+    await adapter.dispose()
+    expect(disconnected).toHaveBeenCalledOnce()
+  })
+
+  it('includes a bounded tool name and argument summary for generic approvals', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Work')
+    const pending = fake.inputs[0]!.options.canUseTool!(
+      'mcp__mail__send',
+      { to: 'person@example.test', body: 'x'.repeat(5_000) },
+      { signal: new AbortController().signal, toolUseID: 'mail' },
+    )
+    const event = events.find((entry) => entry.type === 'approval.requested')
+    if (event?.type !== 'approval.requested') throw new Error('missing approval')
+    expect(event.request.reason).toContain('mcp__mail__send')
+    expect(event.request.reason).toContain('person@example.test')
+    expect(event.request.reason!.length).toBeLessThanOrEqual(2_000)
+    adapter.respondToApproval(event.request.id, 'deny')
+    await pending
+    await adapter.dispose()
+  })
+
+  it('preserves multi-select and stringifies all selected labels for Claude', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Choose')
+    const pending = fake.inputs[0]!.options.canUseTool!(
+      'AskUserQuestion',
+      {
+        questions: [
+          {
+            question: 'constructor',
+            multiSelect: true,
+            options: [{ label: 'React' }, { label: 'Vue' }],
+          },
+        ],
+      },
+      { signal: new AbortController().signal, toolUseID: 'ask' },
+    )
+    const event = events.find((entry) => entry.type === 'user_input.requested')
+    if (event?.type !== 'user_input.requested') throw new Error('missing question')
+    expect(event.request.questions[0]).toMatchObject({ id: 'constructor', multiSelect: true })
+    adapter.respondToUserInput(event.request.id, { constructor: ['React', 'Vue', 'Other choice'] })
+    await expect(pending).resolves.toMatchObject({
+      updatedInput: { answers: { constructor: 'React, Vue, Other choice' } },
+    })
+    await adapter.dispose()
+  })
+
+  it.each([false, true])('passes project MCP safely on open (resume: %s)', async (resume) => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const secret = `canary-${crypto.randomUUID()}`
+    try {
+      const options = {
+        mcpServers: [
+          {
+            id: 'remote',
+            enabled: true as const,
+            transport: {
+              type: 'http' as const,
+              url: 'https://example.test/mcp',
+              headers: { Authorization: { source: 'credential' as const, credentialRef: 'token' } },
+            },
+          },
+        ],
+        mcpCredentials: { token: secret },
+      }
+      const thread = resume
+        ? await adapter.resumeThread('claude-existing', '/repo', options)
+        : await adapter.startThread('/repo', options)
+      expect(JSON.stringify(fake.inputs[0]!.options.mcpServers)).not.toContain(secret)
+      expect(fake.inputs[0]!.options.mcpServers).toEqual({
+        remote: { type: 'http', url: 'http://127.0.0.1:49152/bootstrap' },
+      })
+      expect(Object.values(fake.inputs[0]!.options.env!)).not.toContain(secret)
+      expect(fake.queries[0]!.mcpConfigurations).toEqual([
+        {
+          remote: {
+            type: 'http',
+            url: 'https://example.test/mcp',
+            headers: { Authorization: secret },
+          },
+        },
+      ])
+      expect(
+        (await vi.mocked(createClaudeMcpBootstrap).mock.results.at(-1)!.value).close,
+      ).toHaveBeenCalled()
+      await adapter.sendTurn(thread.id, 'Proceed')
+      expect(
+        (await fake.inputs[0]!.prompt[Symbol.asyncIterator]().next()).value?.message.content,
+      ).toEqual([{ type: 'text', text: 'Proceed' }])
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('rejects inherited disable before creating a Claude process', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    await expect(
+      adapter.startThread('/repo', { mcpServers: [{ id: 'hidden', enabled: false }] }),
+    ).rejects.toThrow('cannot hide an inherited MCP server')
+    expect(fake.inputs).toHaveLength(0)
+    await adapter.dispose()
+  })
+
+  it.each(['initialize', 'factory', 'status', 'configure'] as const)(
+    'cleans up a %s failure and redacts the error',
+    async (phase) => {
+      const fake = harness()
+      const secret = `canary-${crypto.randomUUID()}`
+      const adapter = new ClaudeCodeAdapter({
+        createQuery: (input) => {
+          if (phase === 'factory') throw new Error(`cannot continue: ${secret}`)
+          const query = fake.createQuery(input) as FakeQuery
+          vi.spyOn(
+            query,
+            phase === 'status'
+              ? 'mcpServerStatus'
+              : phase === 'configure'
+                ? 'setMcpServers'
+                : 'initializationResult',
+          ).mockRejectedValue(new Error(`cannot continue: ${secret}`))
+          return query
+        },
+      })
+      const logs: string[] = []
+      adapter.on('log', (line) => logs.push(line))
+      try {
+        await expect(
+          adapter.startThread('/repo', {
+            mcpServers: [
+              {
+                id: 'remote',
+                enabled: true,
+                transport: {
+                  type: 'http',
+                  url: 'https://example.test/mcp',
+                  headers: { Authorization: { source: 'credential', credentialRef: 'token' } },
+                },
+              },
+            ],
+            mcpCredentials: { token: secret },
+          }),
+        ).rejects.toThrow('cannot continue: [REDACTED]')
+        if (phase !== 'factory') {
+          expect(fake.queries[0]!.closed).toBe(true)
+          expect(fake.inputs[0]!.options.abortController!.signal.aborted).toBe(true)
+          expect((await fake.inputs[0]!.prompt[Symbol.asyncIterator]().next()).done).toBe(true)
+        }
+        expect(logs.join('\n')).not.toContain(secret)
+        expect(
+          (await vi.mocked(createClaudeMcpBootstrap).mock.results.at(-1)!.value).close,
+        ).toHaveBeenCalled()
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('bounds stalled initialization and clears the session on timeout', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({
+      startupTimeoutMs: 20,
+      createQuery: (input) => {
+        const query = fake.createQuery(input) as FakeQuery
+        vi.spyOn(query, 'initializationResult').mockImplementation(() => new Promise(() => {}))
+        return query
+      },
+    })
+    await expect(adapter.startThread('/repo')).rejects.toThrow('startup timed out')
+    expect(fake.queries[0]!.closed).toBe(true)
+    await adapter.dispose()
+  })
+
+  it('cancels a pending open immediately when disposed', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({
+      createQuery: (input) => {
+        const query = fake.createQuery(input) as FakeQuery
+        vi.spyOn(query, 'initializationResult').mockImplementation(() => new Promise(() => {}))
+        return query
+      },
+    })
+    const starting = adapter.startThread('/repo')
+    const stopped = expect(starting).rejects.toThrow('Claude session is closed')
+    await adapter.dispose()
+    await stopped
+    expect(fake.queries[0]!.closed).toBe(true)
+  })
+
+  it.each(['status', 'configure'] as const)(
+    'bounds a stalled MCP %s and closes the bootstrap',
+    async (phase) => {
+      const fake = harness()
+      const adapter = new ClaudeCodeAdapter({
+        startupTimeoutMs: 25,
+        createQuery(input) {
+          const query = fake.createQuery(input) as FakeQuery
+          vi.spyOn(
+            query,
+            phase === 'status' ? 'mcpServerStatus' : 'setMcpServers',
+          ).mockImplementation(() => new Promise(() => {}))
+          return query
+        },
+      })
+      try {
+        await expect(
+          adapter.startThread('/repo', {
+            mcpServers: [
+              {
+                id: 'remote',
+                enabled: true,
+                transport: { type: 'http', url: 'https://example.test/mcp' },
+              },
+            ],
+          }),
+        ).rejects.toThrow('startup timed out')
+        expect(fake.queries[0]!.closed).toBe(true)
+        expect(
+          (await vi.mocked(createClaudeMcpBootstrap).mock.results.at(-1)!.value).close,
+        ).toHaveBeenCalled()
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('waits for bootstrap cleanup when disposed during bind', async () => {
+    const fake = harness()
+    let complete!: (value: Awaited<ReturnType<typeof createClaudeMcpBootstrap>>) => void
+    const close = vi.fn(async () => {})
+    vi.mocked(createClaudeMcpBootstrap).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve
+        }),
+    )
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const starting = expect(
+      adapter.startThread('/repo', {
+        mcpServers: [
+          {
+            id: 'remote',
+            enabled: true,
+            transport: { type: 'http', url: 'https://example.test/mcp' },
+          },
+        ],
+      }),
+    ).rejects.toThrow('Claude session is closed')
+    let disposed = false
+    const disposing = adapter.dispose().then(() => {
+      disposed = true
+    })
+    await tick()
+    expect(disposed).toBe(false)
+    complete({
+      servers: { remote: { type: 'http', url: 'http://127.0.0.1:49152/bootstrap' } },
+      close,
+    })
+    await disposing
+    await starting
+    expect(close).toHaveBeenCalled()
+    expect(fake.queries).toHaveLength(0)
+  })
+
+  it('redacts split process stderr and provider errors at their publication boundaries', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const secret = `canary-${crypto.randomUUID()}`
+    const logs: string[] = []
+    const events: DomainEvent[] = []
+    adapter.on('log', (line) => logs.push(line))
+    adapter.on('event', (event) => events.push(event))
+    try {
+      const thread = await adapter.startThread('/repo', {
+        mcpServers: [
+          {
+            id: 'remote',
+            enabled: true,
+            transport: {
+              type: 'http',
+              url: 'https://example.test/mcp',
+              headers: { Authorization: { source: 'credential', credentialRef: 'token' } },
+            },
+          },
+        ],
+        mcpCredentials: { token: secret },
+      })
+      const options = fake.inputs[0]!.options
+      const child = options.spawnClaudeCodeProcess!({
+        command: process.execPath,
+        args: [
+          '-e',
+          "const value=process.env.FIXTURE_TOKEN; process.stderr.write('failure ' + value.slice(0, 9)); setTimeout(()=>process.stderr.end(value.slice(9) + ' tail'), 10)",
+        ],
+        env: { ...options.env, FIXTURE_TOKEN: secret },
+        signal: options.abortController!.signal,
+      })
+      child.stdout.resume()
+      await new Promise<void>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('close', () => resolve())
+      })
+      await tick()
+      expect(logs.join('')).toContain('[REDACTED]')
+      expect(logs.join('')).toContain('tail')
+      await adapter.sendTurn(thread.id, 'Fail safely')
+      const failure = resultMessage(true)
+      if (failure.type !== 'result' || !('errors' in failure))
+        throw new Error('Expected an error result fixture')
+      fake.queries[0]!.emitMessage({ ...failure, errors: [`request failed: ${secret}`] })
+      await tick()
+      expect(events).toContainEqual({
+        type: 'thread.error',
+        threadId: thread.id,
+        message: 'request failed: [REDACTED]',
+      })
+      expect(JSON.stringify({ logs, events })).not.toContain(secret)
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('does not enqueue a turn before startup finishes', async () => {
+    const fake = harness()
+    let initialized!: () => void
+    const adapter = new ClaudeCodeAdapter({
+      createQuery: (input) => {
+        const query = fake.createQuery(input) as FakeQuery
+        const result = query.initializationResult()
+        vi.spyOn(query, 'initializationResult').mockImplementation(async () => {
+          await new Promise<void>((resolve) => {
+            initialized = resolve
+          })
+          return result
+        })
+        return query
+      },
+    })
+    try {
+      const starting = adapter.startThread('/repo')
+      const sessionId = fake.inputs[0]!.options.sessionId!
+      let enqueued = false
+      const sending = adapter.sendTurn(`claude-${sessionId}`, 'Wait for startup').then(() => {
+        enqueued = true
+      })
+      await tick()
+      expect(enqueued).toBe(false)
+      initialized()
+      await starting
+      await sending
+      expect(enqueued).toBe(true)
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it.each(['model', 'interrupt'] as const)(
+    'keeps late %s errors redacted after dispose clears session options',
+    async (control) => {
+      const fake = harness()
+      const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+      const secret = `canary-${crypto.randomUUID()}`
+      const thread = await adapter.startThread('/repo', {
+        mcpServers: [
+          {
+            id: 'remote',
+            enabled: true,
+            transport: {
+              type: 'http',
+              url: 'https://example.test/mcp',
+              headers: { Authorization: { source: 'credential', credentialRef: 'token' } },
+            },
+          },
+        ],
+        mcpCredentials: { token: secret },
+      })
+      let fail!: (error: Error) => void
+      vi.spyOn(fake.queries[0]!, control === 'model' ? 'setModel' : 'interrupt').mockImplementation(
+        () =>
+          new Promise((_, reject) => {
+            fail = reject
+          }),
+      )
+      if (control === 'interrupt') await adapter.sendTurn(thread.id, 'Begin turn')
+      const controlled = expect(
+        control === 'model'
+          ? adapter.sendTurn(thread.id, 'Change model', [], { model: 'sonnet' })
+          : adapter.interrupt(),
+      ).rejects.toThrow('late [REDACTED]')
+      await tick()
+      await adapter.dispose()
+      fail(new Error(`late ${secret}`))
+      await controlled
+    },
+  )
+
+  it('declares the controls supplied by the SDK', () => {
+    expect(CLAUDE_CAPABILITIES).toMatchObject({
+      steer: true,
+      interrupt: true,
+      approvals: true,
+      userInput: true,
+      autoReview: true,
+      images: true,
+    })
+  })
+
+  it('keeps one query alive for follow-up turns and applies live model changes', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const thread = await adapter.startThread('/repo', { model: 'opus', effort: 'high' })
+    const prompts = fake.inputs[0]!.prompt[Symbol.asyncIterator]()
+
+    await adapter.sendTurn(thread.id, 'First')
+    expect((await prompts.next()).value?.message.content).toEqual([{ type: 'text', text: 'First' }])
+    fake.queries[0]!.emitMessage(resultMessage(false))
+    await tick()
+
+    await adapter.sendTurn(thread.id, 'Second', [], { model: 'sonnet' })
+    expect(fake.queries).toHaveLength(1)
+    expect(fake.queries[0]!.modelsSet).toEqual(['sonnet'])
+    expect((await prompts.next()).value?.message.content).toEqual([
+      { type: 'text', text: 'Second' },
+    ])
+    adapter.dispose()
+  })
+
+  it('retries a rejected model transition before enqueuing the prompt', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    try {
+      const thread = await adapter.startThread('/repo', { model: 'opus' })
+      const setModel = vi
+        .spyOn(fake.queries[0]!, 'setModel')
+        .mockRejectedValueOnce(new Error('rejected'))
+      await expect(adapter.sendTurn(thread.id, 'Retry', [], { model: 'sonnet' })).rejects.toThrow(
+        'rejected',
+      )
+      await adapter.sendTurn(thread.id, 'Retry', [], { model: 'sonnet' })
+      expect(setModel).toHaveBeenCalledTimes(2)
+      const prompts = fake.inputs[0]!.prompt[Symbol.asyncIterator]()
+      expect((await prompts.next()).value?.message.content).toEqual([
+        { type: 'text', text: 'Retry' },
+      ])
+    } finally {
+      adapter.dispose()
+    }
+  })
+
+  it('keeps asking for approval after the SDK rejects full access', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    try {
+      const thread = await adapter.startThread('/repo', { approval: 'ask' })
+      await adapter.sendTurn(thread.id, 'Work')
+      vi.spyOn(fake.queries[0]!, 'setPermissionMode').mockRejectedValueOnce(new Error('rejected'))
+      await expect(adapter.setApproval('full')).rejects.toThrow('rejected')
+      const events: DomainEvent[] = []
+      adapter.on('event', (event) => {
+        events.push(event)
+        if (event.type === 'approval.requested') adapter.respondToApproval(event.request.id, 'deny')
+      })
+      const result = await fake.inputs[0]!.options.canUseTool!(
+        'Bash',
+        { command: 'echo test' },
+        {
+          signal: new AbortController().signal,
+          toolUseID: 'permission-failure',
+        },
+      )
+      expect(result.behavior).toBe('deny')
+      expect(events.some((event) => event.type === 'approval.requested')).toBe(true)
+    } finally {
+      adapter.dispose()
+    }
+  })
+
+  it('serializes concurrent configuration without losing an access change', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    try {
+      const thread = await adapter.startThread('/repo', { model: 'opus', approval: 'ask' })
+      let finishModel!: () => void
+      vi.spyOn(fake.queries[0]!, 'setModel').mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishModel = resolve
+          }),
+      )
+      const model = adapter.sendTurn(thread.id, 'Work', [], { model: 'sonnet' })
+      const approval = adapter.setApproval('full')
+      await tick()
+      expect(fake.queries[0]!.permissionModes).toEqual([])
+      finishModel()
+      await Promise.all([model, approval])
+      expect(fake.queries[0]!.permissionModes).toEqual(['bypassPermissions'])
+      const result = await fake.inputs[0]!.options.canUseTool!(
+        'Bash',
+        { command: 'echo test' },
+        {
+          signal: new AbortController().signal,
+          toolUseID: 'concurrent',
+        },
+      )
+      expect(result.behavior).toBe('allow')
+      await expect(adapter.sendTurn(thread.id, 'Duplicate')).rejects.toThrow('running turn')
+    } finally {
+      adapter.dispose()
+    }
+  })
+
+  it('rejects a late permission change after the same adapter is reopened', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    try {
+      const thread = await adapter.startThread('/repo', { approval: 'ask' })
+      let finish!: () => void
+      vi.spyOn(fake.queries[0]!, 'setPermissionMode').mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve
+          }),
+      )
+      const pending = adapter.setApproval('full')
+      const rejected = expect(pending).rejects.toThrow('session changed')
+      await tick()
+      await adapter.dispose()
+      await adapter.resumeThread(thread.id, '/repo', { approval: 'ask' })
+      finish()
+      await rejected
+      expect(fake.inputs[1]!.options.permissionMode).toBe('default')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('creates a session that never received a prompt instead of failing to resume it', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({
+      createQuery: (input) => {
+        const query = fake.createQuery(input) as FakeQuery
+        // Captured from claude 2.1.296: an unused --session-id writes no
+        // transcript, so --resume of that id fails during startup.
+        if (input.options.resume) {
+          vi.spyOn(query, 'initializationResult').mockRejectedValue(
+            new Error(
+              `Claude Code returned an error result: No conversation found with session ID: ${input.options.resume}`,
+            ),
+          )
+        }
+        return query
+      },
+    })
+    const sessionId = crypto.randomUUID()
+    try {
+      const thread = await adapter.resumeThread(`claude-${sessionId}`, '/repo')
+
+      expect(thread.id).toBe(`claude-${sessionId}`)
+      expect(fake.inputs.map(({ options }) => [options.resume, options.sessionId])).toEqual([
+        [sessionId, undefined],
+        [undefined, sessionId],
+      ])
+      expect(fake.queries[0]!.closed).toBe(true)
+      await adapter.sendTurn(thread.id, 'Hello')
+      expect(
+        (await fake.inputs[1]!.prompt[Symbol.asyncIterator]().next()).value?.message.content,
+      ).toEqual([{ type: 'text', text: 'Hello' }])
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('does not reuse a turn identity when a new instance resumes the session', async () => {
+    const first = new ClaudeCodeAdapter({ createQuery: harness().createQuery })
+    const resumed = new ClaudeCodeAdapter({ createQuery: harness().createQuery })
+    try {
+      const thread = await first.startThread('/repo')
+      const previous = await first.sendTurn(thread.id, 'One')
+      first.dispose()
+      await resumed.resumeThread(thread.id, '/repo')
+      const next = await resumed.sendTurn(thread.id, 'Two')
+      expect(next).not.toBe(previous)
+      expect(next).toMatch(new RegExp(`^${thread.id}-turn-`))
+      const previousStart: DomainEvent = {
+        type: 'turn.started',
+        turn: { id: previous, threadId: thread.id, status: 'running', createdAt: 1000 },
+      }
+      const previousEnd: DomainEvent = {
+        type: 'turn.completed',
+        turnId: previous,
+        status: 'completed',
+      }
+      const resumedStart: DomainEvent = {
+        type: 'turn.started',
+        turn: { id: next, threadId: thread.id, status: 'running', createdAt: 9000 },
+      }
+      const state = reduce(reduce(reduce(emptyThread, previousStart), previousEnd), resumedStart)
+      expect(state.activeTurn?.startedAt).toBe(9000)
+      const items: Item[] = [
+        {
+          id: 'prompt-1',
+          type: 'message',
+          role: 'user',
+          turnId: previous,
+          status: 'completed',
+          text: 'One',
+          createdAt: 1000,
+        },
+        {
+          id: 'answer-1',
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          turnId: previous,
+          status: 'completed',
+          text: 'First answer',
+          createdAt: 2000,
+        },
+        {
+          id: 'prompt-2',
+          type: 'message',
+          role: 'user',
+          turnId: next,
+          status: 'completed',
+          text: 'Two',
+          createdAt: 9000,
+        },
+        {
+          id: 'answer-2',
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          turnId: next,
+          status: 'completed',
+          text: 'Second answer',
+          createdAt: 10000,
+        },
+      ]
+      const projection = projectThreadItems(items)
+      expect(projection.turns).toHaveLength(2)
+      expect(projection.presentations.size).toBe(2)
+      const store = new Store(':memory:')
+      try {
+        store.addProject('/repo')
+        store.addThread({
+          id: thread.id,
+          projectPath: '/repo',
+          provider: 'claude-code',
+          title: 'Resumed test',
+        })
+        for (const event of [previousStart, previousEnd, resumedStart])
+          store.append(thread.id, event)
+        expect(store.recoverInterruptedThreads()).toContain(thread.id)
+      } finally {
+        store.close()
+      }
+    } finally {
+      first.dispose()
+      resumed.dispose()
+    }
+  })
+
+  it('does not persist product-internal background sessions', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    await adapter.startThread('/repo', { ephemeral: true })
+
+    expect(fake.inputs[0]!.options.persistSession).toBe(false)
+    adapter.dispose()
+  })
+
+  it('always uses the installed Claude CLI instead of the SDK bundled executable', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    await adapter.startThread('/repo')
+
+    expect(fake.inputs[0]!.options.pathToClaudeCodeExecutable).toBe('claude')
+    expect(fake.inputs[0]!.options.spawnClaudeCodeProcess).toBeTypeOf('function')
+    adapter.dispose()
+  })
+
+  it.each([undefined, 'medium', 'high', 'xhigh', 'max'])(
+    'keeps a new session when the first turn lowers effort from %s',
+    async (effort) => {
+      const fake = harness()
+      const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+      try {
+        const thread = await adapter.startThread('/repo', { effort })
+        const sessionId = fake.inputs[0]!.options.sessionId
+        await adapter.sendTurn(thread.id, 'Start the design brief', [], { effort: 'low' })
+
+        expect(fake.queries).toHaveLength(2)
+        expect(fake.queries[0]!.closed).toBe(true)
+        expect(fake.inputs[1]!.options.sessionId).toBe(sessionId)
+        expect(fake.inputs[1]!.options.resume).toBeUndefined()
+        expect(fake.inputs[1]!.options.effort).toBe('low')
+        const prompts = fake.inputs[1]!.prompt[Symbol.asyncIterator]()
+        expect((await prompts.next()).value?.message.content).toEqual([
+          { type: 'text', text: 'Start the design brief' },
+        ])
+
+        fake.queries[1]!.emitMessage(resultMessage(false))
+        await tick()
+        await adapter.sendTurn(thread.id, 'Build the design', [], { effort: 'high' })
+        expect(fake.inputs[2]!.options.resume).toBe('session-1')
+        expect(fake.inputs[2]!.options.sessionId).toBeUndefined()
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('preserves saved history when effort changes before the first resumed turn', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    try {
+      const thread = await adapter.resumeThread('claude-existing', '/repo', { effort: 'high' })
+      await adapter.sendTurn(thread.id, 'Start the design brief', [], { effort: 'low' })
+
+      expect(fake.queries).toHaveLength(2)
+      expect(fake.inputs[1]!.options.resume).toBe('existing')
+      expect(fake.inputs[1]!.options.sessionId).toBeUndefined()
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('resets resume eligibility when a used adapter opens a new thread', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    try {
+      const first = await adapter.startThread('/repo')
+      await adapter.sendTurn(first.id, 'One')
+      fake.queries[0]!.emitMessage(resultMessage(false))
+      await tick()
+      await adapter.dispose()
+
+      const next = await adapter.startThread('/repo', { effort: 'high' })
+      const sessionId = fake.inputs[1]!.options.sessionId
+      await adapter.sendTurn(next.id, 'Start the design brief', [], { effort: 'low' })
+      expect(fake.inputs[2]!.options.sessionId).toBe(sessionId)
+      expect(fake.inputs[2]!.options.resume).toBeUndefined()
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('resumes through a fresh SDK query when effort changes between turns', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const thread = await adapter.startThread('/repo', { effort: 'low' })
+    await adapter.sendTurn(thread.id, 'One')
+    fake.queries[0]!.emitMessage(resultMessage(false))
+    await tick()
+
+    await adapter.sendTurn(thread.id, 'Think harder', [], { effort: 'high' })
+    expect(fake.queries).toHaveLength(2)
+    expect(fake.inputs[1]!.options.resume).toBe('session-1')
+    expect(fake.inputs[1]!.options.effort).toBe('high')
+    adapter.dispose()
+  })
+
+  it.each(['factory', 'initialize', 'exit'] as const)(
+    'detaches once when an effort restart fails in %s',
+    async (phase) => {
+      const fake = harness()
+      let failing = false
+      const adapter = new ClaudeCodeAdapter({
+        createQuery: (input) => {
+          if (failing && phase === 'factory') throw new Error('Claude could not start')
+          const query = fake.createQuery(input) as FakeQuery
+          if (failing)
+            vi.spyOn(query, 'initializationResult').mockImplementation(async () => {
+              if (phase === 'exit') query.close()
+              await tick()
+              throw new Error('Claude could not start')
+            })
+          return query
+        },
+      })
+      const disconnected = vi.fn()
+      adapter.onDisconnected(disconnected)
+      try {
+        const thread = await adapter.startThread('/repo', { effort: 'low' })
+        await adapter.sendTurn(thread.id, 'Brief')
+        fake.queries[0]!.emitMessage(resultMessage(false))
+        await tick()
+
+        failing = true
+        await expect(adapter.sendTurn(thread.id, 'Build', [], { effort: 'high' })).rejects.toThrow(
+          'Claude could not start',
+        )
+        await tick()
+        expect(disconnected).toHaveBeenCalledOnce()
+        await expect(adapter.sendTurn(thread.id, 'Again')).rejects.toThrow(
+          'Claude session is closed',
+        )
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('streams assistant text through one started/delta/completed lifecycle', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Answer')
+    const query = fake.queries[0]!
+    query.emitMessage(
+      streamEvent('wire-2', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '', citations: null },
+      }),
+    )
+    query.emitMessage(
+      streamEvent('wire-3', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'Hello' },
+      }),
+    )
+    query.emitMessage(streamEvent('wire-4', { type: 'content_block_stop', index: 0 }))
+    await tick()
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'item.started' }),
+        expect.objectContaining({ type: 'item.delta', textDelta: 'Hello' }),
+        expect.objectContaining({
+          type: 'item.completed',
+          item: expect.objectContaining({ text: 'Hello' }),
+        }),
+      ]),
+    )
+    adapter.dispose()
+  })
+
+  it('closes unfinished stream blocks before the turn result', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Answer')
+    const query = fake.queries[0]!
+    query.emitMessage(
+      streamEvent('wire-text', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: 'partial', citations: null },
+      }),
+    )
+    query.emitMessage(
+      streamEvent('wire-tool', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'tool-1', name: 'Read', input: {} },
+      }),
+    )
+    query.emitMessage(resultMessage(true))
+    await tick()
+
+    const terminal = events.findIndex((event) => event.type === 'turn.completed')
+    const completed = events.filter((event) => event.type === 'item.completed')
+    expect(completed).toHaveLength(2)
+    expect(completed.every((event) => event.item.status === 'failed')).toBe(true)
+    expect(events.lastIndexOf(completed[1]!)).toBeLessThan(terminal)
+    adapter.dispose()
+  })
+
+  it('bridges SDK permission requests to TasteCode approvals', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo', { approval: 'ask' })
+    await adapter.sendTurn(thread.id, 'Run it')
+    const canUseTool = fake.inputs[0]!.options.canUseTool!
+    const pending = canUseTool(
+      'Bash',
+      { command: 'npm test' },
+      {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-1',
+        title: 'Claude wants to run npm test',
+      },
+    )
+    const request = events.find((event) => event.type === 'approval.requested')
+    expect(request).toMatchObject({
+      type: 'approval.requested',
+      request: { kind: 'command', command: 'npm test', reason: 'Claude wants to run npm test' },
+    })
+    if (request?.type !== 'approval.requested') throw new Error('approval request missing')
+    adapter.respondToApproval(request.request.id, 'approve')
+    await expect(pending).resolves.toMatchObject({
+      behavior: 'allow',
+      updatedInput: { command: 'npm test' },
+      toolUseID: 'tool-1',
+    })
+    adapter.dispose()
+  })
+
+  it('logs a redacted approval abort failure without ending the active turn', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    const logs: string[] = []
+    const secret = `canary-${crypto.randomUUID()}`
+    adapter.on('event', (event) => events.push(event))
+    adapter.on('log', (line) => logs.push(line))
+    try {
+      const thread = await adapter.startThread('/repo', {
+        approval: 'ask',
+        mcpServers: [
+          {
+            id: 'remote',
+            enabled: true,
+            transport: {
+              type: 'http',
+              url: 'https://example.test/mcp',
+              headers: { Authorization: { source: 'credential', credentialRef: 'token' } },
+            },
+          },
+        ],
+        mcpCredentials: { token: secret },
+      })
+      const turnId = await adapter.sendTurn(thread.id, 'Run it')
+      const interrupt = vi
+        .spyOn(fake.queries[0]!, 'interrupt')
+        .mockRejectedValueOnce(new Error(`cannot stop: ${secret}`))
+      const pending = fake.inputs[0]!.options.canUseTool!(
+        'Bash',
+        { command: 'npm test' },
+        { signal: new AbortController().signal, toolUseID: 'abort-failure' },
+      )
+      const request = events.find((event) => event.type === 'approval.requested')
+      if (request?.type !== 'approval.requested') throw new Error('approval request missing')
+
+      adapter.respondToApproval(request.request.id, 'abort')
+      await expect(pending).resolves.toMatchObject({ behavior: 'deny', interrupt: true })
+      await tick()
+
+      expect(interrupt).toHaveBeenCalledTimes(1)
+      expect(logs).toContain('Could not stop Claude: cannot stop: [REDACTED]')
+      expect(JSON.stringify({ events, logs })).not.toContain(secret)
+      expect(events.filter((event) => event.type === 'approval.resolved')).toEqual([
+        { type: 'approval.resolved', id: request.request.id },
+      ])
+      expect(
+        events.filter((event) => event.type === 'thread.error' || event.type === 'turn.completed'),
+      ).toEqual([])
+      await expect(adapter.sendTurn(thread.id, 'Too soon')).rejects.toThrow('running turn')
+
+      fake.queries[0]!.emitMessage(resultMessage(false))
+      await tick()
+      expect(events.filter((event) => event.type === 'turn.completed')).toEqual([
+        expect.objectContaining({ turnId }),
+      ])
+      await expect(adapter.sendTurn(thread.id, 'Next turn')).resolves.toBeTypeOf('string')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('round-trips AskUserQuestion answers using the question text as Claude expects', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Choose')
+    const pending = fake.inputs[0]!.options.canUseTool!(
+      'AskUserQuestion',
+      {
+        questions: [
+          {
+            header: 'Framework',
+            question: 'Which framework?',
+            options: [{ label: 'React', description: 'Use React' }],
+          },
+        ],
+      },
+      { signal: new AbortController().signal, toolUseID: 'ask-1' },
+    )
+    const request = events.find((event) => event.type === 'user_input.requested')
+    expect(request).toMatchObject({
+      type: 'user_input.requested',
+      request: { questions: [{ id: 'Which framework?', question: 'Which framework?' }] },
+    })
+    if (request?.type !== 'user_input.requested') throw new Error('question request missing')
+    adapter.respondToUserInput(request.request.id, { 'Which framework?': ['React'] })
+    await expect(pending).resolves.toMatchObject({
+      behavior: 'allow',
+      updatedInput: { answers: { 'Which framework?': 'React' } },
+    })
+    adapter.dispose()
+  })
+
+  it('uses SDK control calls for interruption and permission-mode changes', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Work')
+    await adapter.setApproval('full')
+    await adapter.interrupt()
+    expect(fake.queries[0]!.permissionModes).toEqual(['bypassPermissions'])
+    expect(fake.queries[0]!.interrupts).toBe(1)
+    adapter.dispose()
+  })
+
+  it('ends a stopped tool call as interrupted without a diagnostic error', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Run tests')
+    await adapter.interrupt()
+    fake.queries[0]!.emitMessage({
+      ...(resultMessage(true) as object),
+      terminal_reason: 'aborted_tools',
+      errors: ['[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use'],
+    } as SDKMessage)
+    await tick()
+    expect(events.find((event) => event.type === 'turn.completed')).toMatchObject({
+      status: 'interrupted',
+    })
+    expect(events.filter((event) => event.type === 'thread.error')).toEqual([])
+    adapter.dispose()
+  })
+
+  it.each(['receipt first', 'result first'] as const)(
+    'keeps a stopped turn open for a steer that outlives it (%s)',
+    async (order) => {
+      const fake = harness()
+      const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+      const events: DomainEvent[] = []
+      const logs: string[] = []
+      adapter.on('event', (event) => events.push(event))
+      adapter.on('log', (line) => logs.push(line))
+      try {
+        const thread = await adapter.startThread('/repo')
+        const query = fake.queries[0]!
+        const prompts = fake.inputs[0]!.prompt[Symbol.asyncIterator]()
+        const first = await adapter.sendTurn(thread.id, 'A')
+        await prompts.next()
+        await adapter.steer(thread.id, 'B')
+        const steer = (await prompts.next()).value!
+        // The SDK documents that queued async messages survive an interrupt and run next.
+        const stopped = { ...(resultMessage(true) as object), errors: ['aborted'] } as SDKMessage
+        if (order === 'receipt first') {
+          query.stillQueued = [steer.uuid!]
+          await adapter.interrupt()
+          query.emitMessage(stopped)
+        } else {
+          let receipt!: (value: SDKControlInterruptResponse) => void
+          vi.spyOn(query, 'interrupt').mockImplementationOnce(
+            () =>
+              new Promise((resolve) => {
+                receipt = resolve
+              }),
+          )
+          const stopping = adapter.interrupt()
+          query.emitMessage(stopped)
+          await tick()
+          receipt({ still_queued: [steer.uuid!] })
+          await stopping
+        }
+        await tick()
+        await expect(adapter.sendTurn(thread.id, 'C')).rejects.toThrow('running turn')
+
+        query.emitMessage(assistantMessage('message-b', 'Answer to B'))
+        query.emitMessage(resultMessage(false))
+        await tick()
+        const next = await adapter.sendTurn(thread.id, 'C')
+        query.emitMessage(assistantMessage('message-c', 'Answer to C'))
+        query.emitMessage(resultMessage(false))
+        await tick()
+
+        expect(
+          events.flatMap((event) =>
+            event.type === 'item.completed' && event.item.type === 'message'
+              ? [{ turnId: event.item.turnId, text: event.item.text }]
+              : [],
+          ),
+        ).toEqual([
+          { turnId: first, text: 'Answer to B' },
+          { turnId: next, text: 'Answer to C' },
+        ])
+        expect(events.filter((event) => event.type === 'turn.started')).toHaveLength(2)
+        expect(events.filter((event) => event.type === 'turn.completed')).toEqual([
+          { type: 'turn.completed', turnId: first, status: 'completed' },
+          { type: 'turn.completed', turnId: next, status: 'completed' },
+        ])
+        expect(events.filter((event) => event.type === 'thread.error')).toEqual([])
+        expect(logs.filter((line) => line.includes('outside an active turn'))).toEqual([])
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it.each(['without Stop', 'with Stop after the steer started'] as const)(
+    'keeps a steered turn open until the steer has run (%s)',
+    async (variant) => {
+      const fake = harness()
+      const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+      const events: DomainEvent[] = []
+      adapter.on('event', (event) => events.push(event))
+      try {
+        const thread = await adapter.startThread('/repo')
+        const query = fake.queries[0]!
+        const prompts = fake.inputs[0]!.prompt[Symbol.asyncIterator]()
+        query.emitMessage(initMessage(['interrupt_receipt_v1', 'msg_lifecycle_v1']))
+        const first = await adapter.sendTurn(thread.id, 'A')
+        const prompt = (await prompts.next()).value!
+        await adapter.steer(thread.id, 'B')
+        const steer = (await prompts.next()).value!
+        // Captured order: the steer cuts run A short, and A's result comes before A's cancel
+        // and before the steer starts. A Stop sent after that start finds nothing queued.
+        query.emitMessage(lifecycle(steer.uuid!, 'queued'))
+        query.emitMessage(assistantMessage('message-a', 'Story'))
+        query.emitMessage(resultMessage(false))
+        query.emitMessage(lifecycle(prompt.uuid!, 'cancelled'))
+        query.emitMessage(lifecycle(steer.uuid!, 'started'))
+        await tick()
+        await expect(adapter.sendTurn(thread.id, 'C')).rejects.toThrow('running turn')
+        if (variant === 'without Stop') {
+          query.emitMessage(assistantMessage('message-b', 'Answer to B'))
+          query.emitMessage(resultMessage(false))
+        } else {
+          query.stillQueued = []
+          await adapter.interrupt()
+          query.emitMessage({
+            ...(resultMessage(true) as object),
+            errors: ['aborted'],
+          } as SDKMessage)
+        }
+        query.emitMessage(lifecycle(steer.uuid!, 'completed'))
+        await tick()
+        const next = await adapter.sendTurn(thread.id, 'C')
+        query.emitMessage(assistantMessage('message-c', 'Answer to C'))
+        query.emitMessage(resultMessage(false))
+        await tick()
+
+        expect(messageTexts(events)).toEqual([
+          { turnId: first, text: 'Story' },
+          ...(variant === 'without Stop' ? [{ turnId: first, text: 'Answer to B' }] : []),
+          { turnId: next, text: 'Answer to C' },
+        ])
+        expect(events.filter((event) => event.type === 'turn.started')).toHaveLength(2)
+        expect(events.filter((event) => event.type === 'turn.completed')).toEqual([
+          {
+            type: 'turn.completed',
+            turnId: first,
+            status: variant === 'without Stop' ? 'completed' : 'interrupted',
+          },
+          { type: 'turn.completed', turnId: next, status: 'completed' },
+        ])
+      } finally {
+        await adapter.dispose()
+      }
+    },
+  )
+
+  it('ends a held turn when its waiting steer is cancelled without a run', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    try {
+      const thread = await adapter.startThread('/repo')
+      const query = fake.queries[0]!
+      const prompts = fake.inputs[0]!.prompt[Symbol.asyncIterator]()
+      query.emitMessage(initMessage(['msg_lifecycle_v1']))
+      const first = await adapter.sendTurn(thread.id, 'A')
+      await prompts.next()
+      await adapter.steer(thread.id, 'B')
+      const steer = (await prompts.next()).value!
+      query.emitMessage(lifecycle(steer.uuid!, 'queued'))
+      query.emitMessage(resultMessage(false))
+      await tick()
+      expect(events.filter((event) => event.type === 'turn.completed')).toEqual([])
+
+      query.emitMessage(lifecycle(steer.uuid!, 'cancelled'))
+      await tick()
+      expect(events.filter((event) => event.type === 'turn.completed')).toEqual([
+        { type: 'turn.completed', turnId: first, status: 'completed' },
+      ])
+      await expect(adapter.sendTurn(thread.id, 'C')).resolves.toBeTypeOf('string')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('opens a turn for output that arrives after its own turn ended', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    try {
+      const thread = await adapter.startThread('/repo')
+      const query = fake.queries[0]!
+      const first = await adapter.sendTurn(thread.id, 'A')
+      await adapter.steer(thread.id, 'B')
+      // An older CLI sends no interrupt receipt, so nothing says the steer still runs.
+      await adapter.interrupt()
+      query.emitMessage({ ...(resultMessage(true) as object), errors: ['aborted'] } as SDKMessage)
+      query.emitMessage(
+        streamEvent('wire-b', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: 'Answer to B', citations: null },
+        }),
+      )
+      query.emitMessage(streamEvent('wire-b-stop', { type: 'content_block_stop', index: 0 }))
+      await tick()
+      await expect(adapter.sendTurn(thread.id, 'C')).rejects.toThrow('running turn')
+      query.emitMessage(resultMessage(false))
+      await tick()
+
+      const started = events.flatMap((event) =>
+        event.type === 'turn.started' ? [event.turn.id] : [],
+      )
+      expect(started).toHaveLength(2)
+      expect(started[0]).toBe(first)
+      expect(events).toContainEqual({
+        type: 'item.completed',
+        item: expect.objectContaining({ turnId: started[1], text: 'Answer to B' }),
+      })
+      expect(events.filter((event) => event.type === 'turn.completed')).toEqual([
+        { type: 'turn.completed', turnId: first, status: 'interrupted' },
+        { type: 'turn.completed', turnId: started[1], status: 'completed' },
+      ])
+      await expect(adapter.sendTurn(thread.id, 'C')).resolves.toBeTypeOf('string')
+    } finally {
+      await adapter.dispose()
+    }
+  })
+
+  it('still reports a real error when the stop request itself failed', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo')
+    await adapter.sendTurn(thread.id, 'Run tests')
+    vi.spyOn(fake.queries[0]!, 'interrupt').mockRejectedValueOnce(new Error('control failed'))
+    await expect(adapter.interrupt()).rejects.toThrow('control failed')
+    fake.queries[0]!.emitMessage({
+      ...(resultMessage(true) as object),
+      errors: ['API error: overloaded'],
+    } as SDKMessage)
+    await tick()
+    expect(events.find((event) => event.type === 'turn.completed')).toMatchObject({
+      status: 'failed',
+    })
+    expect(events.find((event) => event.type === 'thread.error')).toMatchObject({
+      message: 'API error: overloaded',
+    })
+    adapter.dispose()
+  })
+
+  it('keeps subagent messages out of the main transcript, plan and model label', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo', { model: 'opus' })
+    await adapter.sendTurn(thread.id, 'Delegate')
+    const query = fake.queries[0]!
+    query.emitMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'task-1',
+      uuid: crypto.randomUUID(),
+      session_id: 'session-1',
+      message: {
+        id: 'sub-msg',
+        role: 'assistant',
+        model: 'claude-sonnet-5',
+        type: 'message',
+        content: [
+          { type: 'text', text: 'Subagent internal notes' },
+          {
+            type: 'tool_use',
+            id: 'sub-todo',
+            name: 'TodoWrite',
+            input: { todos: [{ content: 'sub step', status: 'pending' }] },
+          },
+        ],
+      },
+    } as unknown as SDKMessage)
+    query.emitMessage({
+      type: 'user',
+      parent_tool_use_id: 'task-1',
+      uuid: crypto.randomUUID(),
+      session_id: 'session-1',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'sub-todo', content: 'Todos updated' }],
+      },
+    } as unknown as SDKMessage)
+    query.emitMessage(resultMessage(false))
+    await tick()
+    expect(events.filter((event) => event.type.startsWith('item.'))).toEqual([])
+    expect(events.filter((event) => event.type === 'plan.updated')).toEqual([])
+    expect(events.find((event) => event.type === 'usage.updated')).toMatchObject({
+      usage: { model: 'opus' },
+    })
+    adapter.dispose()
+  })
+
+  it('reports each turn its own share of the running session cost', async () => {
+    const fake = harness()
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const events: DomainEvent[] = []
+    adapter.on('event', (event) => events.push(event))
+    const thread = await adapter.startThread('/repo', { effort: 'high' })
+    const finish = async (query: FakeQuery, total: number) => {
+      query.emitMessage({
+        ...(resultMessage(false) as object),
+        total_cost_usd: total,
+      } as SDKMessage)
+      await tick()
+    }
+    await adapter.sendTurn(thread.id, 'First')
+    await finish(fake.queries[0]!, 0.1)
+    await adapter.sendTurn(thread.id, 'Second')
+    await finish(fake.queries[0]!, 0.25)
+    // An effort change restarts the query, and the resumed query's total starts over.
+    await adapter.sendTurn(thread.id, 'Third', [], { effort: 'low' })
+    await finish(fake.queries[1]!, 0.05)
+    const costs = events.flatMap((event) =>
+      event.type === 'usage.updated' ? [event.usage.costUsd] : [],
+    )
+    expect(costs.map((cost) => cost?.toFixed(2))).toEqual(['0.10', '0.15', '0.05'])
+    const store = new Store(':memory:')
+    try {
+      store.addProject('/repo')
+      store.addThread({
+        id: thread.id,
+        projectPath: '/repo',
+        provider: 'claude-code',
+        title: 'Cost',
+      })
+      for (const event of events) store.append(thread.id, event)
+      expect(store.usageSummary(thread.id, 0).session.costUsd).toBeCloseTo(0.3)
+    } finally {
+      store.close()
+      adapter.dispose()
+    }
+  })
+
+  it('drops the synthetic default, deduplicates context aliases, and keeps the catalog', async () => {
+    const fake = harness([
+      {
+        value: 'default',
+        resolvedModel: 'claude-opus-5[1m]',
+        displayName: 'Default (recommended)',
+        description: 'Account default',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'opus[1m]',
+        resolvedModel: 'claude-opus-5[1m]',
+        displayName: 'Opus (1M context)',
+        description: 'Opus 5 with 1M context',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'claude-fable-5[1m]',
+        resolvedModel: 'claude-fable-5',
+        displayName: 'Fable',
+        description: 'Fable 5',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'claude-fable-5-1[1m]',
+        resolvedModel: 'claude-fable-5-1',
+        displayName: 'Fable',
+        description: 'Fable 5.1',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'sonnet',
+        resolvedModel: 'claude-sonnet-5',
+        displayName: 'Sonnet',
+        description: 'Sonnet 5',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
+      {
+        value: 'haiku',
+        resolvedModel: 'claude-haiku-4-5-20251001',
+        displayName: 'Haiku',
+        description: 'Haiku 4.5',
+      },
+    ])
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const models = await adapter.listModels()
+    expect(
+      models.map((model) => ({
+        id: model.id,
+        displayName: model.displayName,
+        isDefault: model.isDefault,
+      })),
+    ).toEqual([
+      { id: 'claude-fable-5-1[1m]', displayName: 'Fable 5.1', isDefault: false },
+      { id: 'claude-opus-5-5', displayName: 'Opus 5.5', isDefault: false },
+      { id: 'claude-sonnet-5-5', displayName: 'Sonnet 5.5', isDefault: false },
+      { id: 'claude-haiku-5-5', displayName: 'Haiku 5.5', isDefault: false },
+      { id: 'claude-fable-5[1m]', displayName: 'Fable 5', isDefault: false },
+      { id: 'opus[1m]', displayName: 'Opus 5', isDefault: true },
+      { id: 'sonnet', displayName: 'Sonnet 5', isDefault: false },
+      { id: 'claude-opus-4-8', displayName: 'Opus 4.8', isDefault: false },
+      { id: 'claude-opus-4-7', displayName: 'Opus 4.7', isDefault: false },
+      { id: 'claude-opus-4-6', displayName: 'Opus 4.6', isDefault: false },
+      { id: 'claude-opus-4-5', displayName: 'Opus 4.5', isDefault: false },
+      { id: 'claude-sonnet-4-6', displayName: 'Sonnet 4.6', isDefault: false },
+      { id: 'haiku', displayName: 'Haiku 4.5', isDefault: false },
+    ])
+    expect(models.some((model) => model.id === 'default')).toBe(false)
+    expect(models.filter((model) => model.displayName.includes('1M context'))).toEqual([])
+    expect(models.filter((model) => model.isDefault)).toHaveLength(1)
+    expect(fake.inputs[0]!.options.persistSession).toBe(false)
+    adapter.dispose()
+  })
+
+  it('lists the aliases claude 2.1.296 resolves to the 5.5 lineup once, in tier order', async () => {
+    const efforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+    const fake = harness([
+      {
+        value: 'default',
+        resolvedModel: 'claude-opus-5-5',
+        displayName: 'Default (recommended)',
+        description: 'Opus 5.5',
+        supportsEffort: true,
+        supportedEffortLevels: [...efforts],
+      },
+      {
+        value: 'claude-fable-5-1[1m]',
+        resolvedModel: 'claude-fable-5-1',
+        displayName: 'Fable',
+        description: 'Fable 5.1',
+        supportsEffort: true,
+        supportedEffortLevels: [...efforts],
+      },
+      {
+        value: 'opus',
+        resolvedModel: 'claude-opus-5-5',
+        displayName: 'Opus',
+        description: 'Opus 5.5',
+        supportsEffort: true,
+        supportedEffortLevels: [...efforts],
+      },
+      {
+        value: 'sonnet',
+        resolvedModel: 'claude-sonnet-5-5',
+        displayName: 'Sonnet',
+        description: 'Sonnet 5.5',
+        supportsEffort: true,
+        supportedEffortLevels: [...efforts],
+      },
+      {
+        value: 'haiku',
+        resolvedModel: 'claude-haiku-5-5',
+        displayName: 'Haiku',
+        description: 'Haiku 5.5',
+        supportsEffort: true,
+        supportedEffortLevels: [...efforts],
+      },
+    ])
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const models = await adapter.listModels()
+    expect(
+      models.map((model) => ({
+        id: model.id,
+        displayName: model.displayName,
+        isDefault: model.isDefault,
+      })),
+    ).toEqual([
+      { id: 'claude-fable-5-1[1m]', displayName: 'Fable 5.1', isDefault: false },
+      { id: 'opus', displayName: 'Opus 5.5', isDefault: true },
+      { id: 'sonnet', displayName: 'Sonnet 5.5', isDefault: false },
+      { id: 'haiku', displayName: 'Haiku 5.5', isDefault: false },
+      { id: 'claude-fable-5', displayName: 'Fable 5', isDefault: false },
+      { id: 'claude-opus-5', displayName: 'Opus 5', isDefault: false },
+      { id: 'claude-sonnet-5', displayName: 'Sonnet 5', isDefault: false },
+      { id: 'claude-opus-4-8', displayName: 'Opus 4.8', isDefault: false },
+      { id: 'claude-opus-4-7', displayName: 'Opus 4.7', isDefault: false },
+      { id: 'claude-opus-4-6', displayName: 'Opus 4.6', isDefault: false },
+      { id: 'claude-opus-4-5', displayName: 'Opus 4.5', isDefault: false },
+      { id: 'claude-sonnet-4-6', displayName: 'Sonnet 4.6', isDefault: false },
+      { id: 'claude-haiku-4-5', displayName: 'Haiku 4.5', isDefault: false },
+    ])
+    expect(models.find((model) => model.id === 'haiku')?.reasoningEfforts).toEqual([...efforts])
+    adapter.dispose()
+  })
+
+  it('keeps the catalog default when the runtime reports no default row', async () => {
+    const fake = harness([
+      {
+        value: 'claude-fable-5-1[1m]',
+        resolvedModel: 'claude-fable-5-1',
+        displayName: 'Fable',
+        description: 'Fable 5.1',
+        supportsEffort: true,
+      },
+      {
+        value: 'opus',
+        resolvedModel: 'claude-opus-5-5',
+        displayName: 'Opus',
+        description: 'Opus 5.5',
+        supportsEffort: true,
+      },
+    ])
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const models = await adapter.listModels()
+    expect(models.filter((model) => model.isDefault).map((model) => model.id)).toEqual(['opus'])
+    adapter.dispose()
+  })
+
+  it('places models the catalog does not list after the current lineup, newest first', async () => {
+    const fake = harness([
+      {
+        value: 'default',
+        resolvedModel: 'claude-opus-6',
+        displayName: 'Default',
+        description: 'Account default',
+        supportsEffort: true,
+      },
+      {
+        value: 'sonnet',
+        resolvedModel: 'claude-sonnet-5-6',
+        displayName: 'Sonnet',
+        description: 'Latest Sonnet',
+        supportsEffort: true,
+      },
+      {
+        value: 'claude-haiku-6',
+        resolvedModel: 'claude-haiku-6',
+        displayName: 'Haiku 6',
+        description: 'Latest Haiku',
+      },
+      {
+        value: 'opus[1m]',
+        resolvedModel: 'claude-opus-6[1m]',
+        displayName: 'Opus (1M context)',
+        description: 'Latest Opus with 1M context',
+        supportsEffort: true,
+      },
+      {
+        value: 'opus',
+        resolvedModel: 'claude-opus-6',
+        displayName: 'Opus',
+        description: 'Latest Opus',
+        supportsEffort: true,
+      },
+      {
+        value: 'experimental',
+        resolvedModel: 'claude-experimental',
+        displayName: 'Experimental',
+        description: 'Research preview',
+      },
+    ])
+    const adapter = new ClaudeCodeAdapter({ createQuery: fake.createQuery })
+    const models = await adapter.listModels()
+    expect(models.map((model) => model.displayName)).toEqual([
+      'Fable 5.1',
+      'Opus 5.5',
+      'Sonnet 5.5',
+      'Haiku 5.5',
+      'Opus 6',
+      'Haiku 6',
+      'Sonnet 5.6',
+      'Experimental',
+      'Fable 5',
+      'Opus 5',
+      'Sonnet 5',
+      'Opus 4.8',
+      'Opus 4.7',
+      'Opus 4.6',
+      'Opus 4.5',
+      'Sonnet 4.6',
+      'Haiku 4.5',
+    ])
+    expect(models.find((model) => model.isDefault)?.id).toBe('opus')
+    expect(models.some((model) => model.id === 'opus[1m]')).toBe(false)
+    adapter.dispose()
+  })
+})
+
+describe('Claude static model catalog', () => {
+  it('lists the current lineup first, then older generations in tier order', () => {
+    expect(CLAUDE_MODELS.map((model) => model.id)).toEqual([
+      'claude-fable-5-1',
+      'claude-opus-5-5',
+      'claude-sonnet-5-5',
+      'claude-haiku-5-5',
+      'claude-fable-5',
+      'claude-opus-5',
+      'claude-sonnet-5',
+      'claude-opus-4-8',
+      'claude-opus-4-7',
+      'claude-opus-4-6',
+      'claude-opus-4-5',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+    ])
+    expect(CLAUDE_MODELS.filter((model) => model.isDefault).map((model) => model.id)).toEqual([
+      'claude-opus-5-5',
+    ])
+  })
+
+  it('offers the efforts each model accepts', () => {
+    const efforts = (id: string) => CLAUDE_MODELS.find((model) => model.id === id)?.reasoningEfforts
+    for (const id of ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
+      expect(efforts(id)).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    }
+    expect(efforts('claude-haiku-4-5')).toEqual([])
+    expect(CLAUDE_MODELS.find((model) => model.id === 'claude-opus-4-7')).toMatchObject({
+      defaultReasoningEffort: 'xhigh',
+    })
+  })
+})
+
+describe('Claude SDK user messages', () => {
+  it('keeps long unicode and multiline prompts in the SDK message body', () => {
+    const text = ` Grüße 🧪\n${'x'.repeat(40_000)}`
+    expect(claudeUserMessage(text).message).toEqual({
+      role: 'user',
+      content: [{ type: 'text', text }],
+    })
+  })
+
+  it('embeds images and keeps other selected files readable by path', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'harness-claude-attachment-'))
+    try {
+      const image = path.join(directory, 'sample.png')
+      const document = path.join(directory, 'notes.txt')
+      writeFileSync(image, 'image bytes')
+      writeFileSync(document, 'notes')
+      expect(claudeUserMessage('Describe these.', [image, document]).message.content).toEqual([
+        {
+          type: 'text',
+          text: `Describe these.\n\nAttached file paths:\n- ${JSON.stringify(document)}`,
+        },
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: Buffer.from('image bytes').toString('base64'),
+          },
+        },
+      ])
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+function streamEvent(
+  uuid: string,
+  event: SDKPartialAssistantMessage['event'],
+): SDKPartialAssistantMessage {
+  return {
+    type: 'stream_event',
+    event,
+    uuid,
+    session_id: 'session-1',
+    parent_tool_use_id: null,
+  }
+}
+
+function assistantMessage(id: string, text: string): SDKMessage {
+  // SAFETY: The adapter reads only the envelope, message id, model and content of this fixture.
+  return {
+    type: 'assistant',
+    parent_tool_use_id: null,
+    uuid: crypto.randomUUID(),
+    session_id: 'session-1',
+    message: {
+      id,
+      role: 'assistant',
+      model: 'claude-opus-5',
+      type: 'message',
+      content: [{ type: 'text', text }],
+    },
+  } as unknown as SDKMessage
+}
+
+function resultMessage(isError: boolean): SDKMessage {
+  // SAFETY: This captured result fixture contains every field read by the adapter;
+  // the SDK's expanding NonNullableUsage contract adds unrelated telemetry fields.
+  return {
+    type: 'result',
+    subtype: isError ? 'error_during_execution' : 'success',
+    is_error: isError,
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+    stop_reason: null,
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    errors: isError ? ['failed'] : undefined,
+    result: isError ? undefined : 'ok',
+    uuid: crypto.randomUUID(),
+    session_id: 'session-1',
+  } as SDKMessage
+}
+
+function initMessage(capabilities: string[]): SDKMessage {
+  // SAFETY: The adapter reads only the model, version and capabilities of this fixture.
+  return {
+    type: 'system',
+    subtype: 'init',
+    model: 'claude-opus-5',
+    capabilities,
+    uuid: crypto.randomUUID(),
+    session_id: 'session-1',
+  } as unknown as SDKMessage
+}
+
+/** Captured from claude 2.1.296; the SDK's message union does not declare this type. */
+function lifecycle(commandUuid: string, state: string): SDKMessage {
+  return {
+    type: 'command_lifecycle',
+    command_uuid: commandUuid,
+    state,
+    uuid: crypto.randomUUID(),
+    session_id: 'session-1',
+  } as unknown as SDKMessage
+}
+
+function messageTexts(events: DomainEvent[]) {
+  return events.flatMap((event) =>
+    event.type === 'item.completed' && event.item.type === 'message'
+      ? [{ turnId: event.item.turnId, text: event.item.text }]
+      : [],
+  )
+}

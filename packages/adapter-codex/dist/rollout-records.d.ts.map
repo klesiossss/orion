@@ -1,0 +1,1 @@
+{"version":3,"file":"rollout-records.d.ts","sourceRoot":"","sources":["../src/rollout-records.ts"],"names":[],"mappings":"AAGA,KAAK,UAAU,GAAG,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CAAA;AA0BzC;;;;;;;GAOG;AACH,wBAAsB,iBAAiB,CACrC,IAAI,EAAE,MAAM,EACZ,YAAY,CAAC,EAAE,WAAW,CAAC,MAAM,CAAC,GACjC,OAAO,CAAC,KAAK,CAAC;IAAE,KAAK,EAAE,MAAM,CAAC;IAAC,MAAM,EAAE,UAAU,CAAA;CAAE,CAAC,CAAC,CA4BvD"}

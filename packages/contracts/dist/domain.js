@@ -1,0 +1,404 @@
+import { z } from 'zod';
+/**
+ * The provider-agnostic model every adapter translates into.
+ *
+ * Thread -> Turn -> Item, borrowed from Codex's app-server because it is the
+ * best-designed of the available models and maps straight onto the UI. Nothing
+ * engine-specific may leak past an adapter.
+ */
+export const ProviderIdSchema = z.enum(['codex', 'claude-code', 'grok']);
+/**
+ * Every distinct thing an agent produces inside a turn. The UI renders each of
+ * these differently — that is the whole point of not collapsing them to text.
+ */
+export const ItemTypeSchema = z.enum([
+    'message',
+    'reasoning',
+    'command',
+    'file_change',
+    'tool_call',
+    'plan',
+    'error',
+    /** An event an adapter did not recognise. Rendered as raw text, never dropped. */
+    'unknown',
+]);
+export const ItemStatusSchema = z.enum(['started', 'completed', 'failed']);
+export const AssistantPhaseSchema = z.enum(['commentary', 'final_answer']);
+export const ItemSchema = z.object({
+    /**
+     * Stable identity for exactly one started -> deltas -> completed lifecycle.
+     * Producers must not reuse it; per-event validation cannot enforce uniqueness across a log.
+     */
+    id: z.string(),
+    turnId: z.string(),
+    type: ItemTypeSchema,
+    status: ItemStatusSchema,
+    /** Present on `message`. */
+    role: z.enum(['user', 'assistant']).optional(),
+    /** Present when a provider reliably classifies an assistant message; absent means unknown. */
+    phase: AssistantPhaseSchema.optional(),
+    /** Accumulated text. Deltas append here. */
+    text: z.string().optional(),
+    /** Absolute paths attached to a user message. The renderer only previews images. */
+    attachments: z.array(z.string()).optional(),
+    /** Present on `command`: the command line and its exit code once finished. */
+    command: z.string().optional(),
+    exitCode: z.number().optional(),
+    /** How long a command ran. Shown because a slow step is worth noticing. */
+    durationMs: z.number().optional(),
+    /** Present on `file_change`. */
+    path: z.string().optional(),
+    linesAdded: z.number().optional(),
+    linesRemoved: z.number().optional(),
+    createdAt: z.number(),
+});
+export const TurnSchema = z.object({
+    id: z.string(),
+    threadId: z.string(),
+    status: z.enum(['running', 'completed', 'interrupted', 'failed']),
+    createdAt: z.number(),
+});
+export const ThreadSchema = z.object({
+    id: z.string(),
+    provider: ProviderIdSchema,
+    /** Absolute path to the workspace this thread operates on. */
+    workspacePath: z.string(),
+    title: z.string().optional(),
+    createdAt: z.number(),
+});
+/**
+ * What an adapter emits. The server persists these to the event log and pushes
+ * them to clients; adapters never talk to the UI directly.
+ */
+/**
+ * The agent asking permission before it does something.
+ *
+ * This is the highest-privilege moment in the app: answering yes authorises
+ * arbitrary execution or a write to disk. Everything about how it is shown and
+ * answered is deliberate.
+ */
+export const ApprovalRequestSchema = z.object({
+    id: z.string(),
+    kind: z.enum(['command', 'file_change', 'permissions']),
+    /** Why the agent says it needs this. Shown verbatim; it is their words. */
+    reason: z.string().optional(),
+    /** Present on `command`. */
+    command: z.string().optional(),
+    cwd: z.string().optional(),
+    /** Present on `file_change` and `permissions`. */
+    path: z.string().optional(),
+    createdAt: z.number(),
+});
+export const ApprovalDecisionSchema = z.enum(['approve', 'approve-session', 'deny', 'abort']);
+export const ApprovalReviewSchema = z.object({
+    id: z.string(),
+    turnId: z.string(),
+    status: z.enum(['in_progress', 'approved', 'denied', 'timed_out', 'aborted']),
+    /** A provider-neutral description of the access being reviewed. */
+    description: z.string(),
+    rationale: z.string().optional(),
+    riskLevel: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+    startedAt: z.number(),
+    completedAt: z.number().optional(),
+});
+export const UserInputOptionSchema = z.object({
+    label: z.string().min(1),
+    description: z.string().min(1),
+});
+export const UserInputQuestionSchema = z.object({
+    id: z.string().min(1),
+    header: z.string().min(1),
+    question: z.string().min(1),
+    allowOther: z.boolean(),
+    secret: z.boolean(),
+    options: z.array(UserInputOptionSchema).nullable(),
+    /** The user may pick more than one option. Absent means a single choice. */
+    multiSelect: z.boolean().optional(),
+});
+/** A provider-neutral question set that blocks the current agent turn. */
+export const UserInputRequestSchema = z.object({
+    id: z.string().min(1),
+    turnId: z.string().min(1),
+    questions: z.array(UserInputQuestionSchema).min(1),
+    autoResolutionMs: z.number().int().min(60_000).max(240_000).nullable(),
+    createdAt: z.number(),
+});
+/** A step in the agent's own plan for the current turn. */
+export const PlanStepSchema = z.object({
+    text: z.string(),
+    status: z.enum(['pending', 'running', 'done']),
+});
+export const UsageSchema = z.object({
+    inputTokens: z.number(),
+    cachedInputTokens: z.number(),
+    outputTokens: z.number(),
+    reasoningTokens: z.number(),
+    totalTokens: z.number(),
+    /** Model that produced this usage, when the runtime can identify it. */
+    model: z.string().min(1).optional(),
+    /** True when the counters cover the whole session rather than one response. */
+    cumulative: z.boolean().optional(),
+    /** Whether cached input is already included in `inputTokens`. */
+    inputIncludesCached: z.boolean().optional(),
+    /** Actual cost reported by the provider. Absent when it would be an estimate. */
+    costUsd: z.number().nonnegative().optional(),
+    contextWindow: z.number().optional(),
+});
+export const DomainEventSchema = z.discriminatedUnion('type', [
+    z.object({ type: z.literal('thread.started'), thread: ThreadSchema }),
+    z.object({ type: z.literal('turn.started'), turn: TurnSchema }),
+    z.object({ type: z.literal('item.started'), item: ItemSchema }),
+    z.object({
+        type: z.literal('item.delta'),
+        turnId: z.string(),
+        itemId: z.string(),
+        textDelta: z.string(),
+    }),
+    z.object({ type: z.literal('item.completed'), item: ItemSchema }),
+    z.object({
+        type: z.literal('turn.completed'),
+        turnId: z.string(),
+        status: z.enum(['completed', 'interrupted', 'failed']),
+        /** Server receipt time. Optional so histories written before this field still replay. */
+        completedAt: z.number().optional(),
+    }),
+    z.object({ type: z.literal('thread.error'), threadId: z.string(), message: z.string() }),
+    /** The agent's plan for this turn, replaced wholesale each time it changes. */
+    z.object({
+        type: z.literal('plan.updated'),
+        turnId: z.string(),
+        steps: z.array(PlanStepSchema),
+    }),
+    /** Token spend so far. Surfaced live rather than at the end of a turn. */
+    z.object({ type: z.literal('usage.updated'), usage: UsageSchema }),
+    /**
+     * Everything this turn changed, as one unified diff. Kept separate from the
+     * per-file items because "what did it do to my repo" is a different question
+     * from "what did it do next", and the answer must not be assembled by hand.
+     */
+    z.object({ type: z.literal('diff.updated'), turnId: z.string(), diff: z.string() }),
+    z.object({ type: z.literal('approval.requested'), request: ApprovalRequestSchema }),
+    /** Resolved — by the user, or because the turn ended without an answer. */
+    z.object({ type: z.literal('approval.resolved'), id: z.string() }),
+    z.object({ type: z.literal('user_input.requested'), request: UserInputRequestSchema }),
+    z.object({ type: z.literal('user_input.resolved'), id: z.string() }),
+    z.object({ type: z.literal('approval.review.started'), review: ApprovalReviewSchema }),
+    z.object({ type: z.literal('approval.review.completed'), review: ApprovalReviewSchema }),
+]);
+/**
+ * How much of the session context the user may shape before a session starts.
+ * Engines expose this very differently — a token budget, a percentage, a model
+ * variant — so each adapter declares what it can honour and translates the
+ * shared settings itself.
+ */
+export const ContextControlSchema = z.object({
+    /** Window sizes in tokens the engine accepts. The first is its own default. */
+    windows: z.array(z.number().int().positive()).min(1),
+    /** The point where the engine compacts on its own can be moved. */
+    compaction: z.boolean(),
+    /** Automatic compaction can be switched off entirely. */
+    compactionOff: z.boolean(),
+    /** Where the engine compacts when left alone, as a percent of its default window. */
+    defaultCompactAt: z.number().int().min(1).max(100).optional(),
+    /** The latest compaction point the engine honours. A later one would have no effect. */
+    latestCompactAt: z.number().int().min(10).max(99).optional(),
+});
+/**
+ * What an engine can actually do. The UI reads this and hides what is
+ * unavailable rather than showing a button that fails — capability negotiation
+ * is the difference between a wrapper that feels solid and one that lies.
+ */
+export const CapabilitiesSchema = z.object({
+    steer: z.boolean(),
+    fork: z.boolean(),
+    interrupt: z.boolean(),
+    reasoningItems: z.boolean(),
+    approvals: z.boolean(),
+    /** Can pause a turn for structured questions and resume it with the user's answers. */
+    userInput: z.boolean().optional(),
+    /** Can route elevated approval requests through an automatic risk reviewer. */
+    autoReview: z.boolean().optional(),
+    images: z.boolean(),
+    /** Absent when the engine decides its context on its own. */
+    context: ContextControlSchema.optional(),
+});
+/**
+ * A model the user can pick, as reported by the provider itself. We never keep
+ * a hardcoded list — vendors ship new models constantly and a stale dropdown is
+ * worse than no dropdown.
+ */
+export const ModelSchema = z.object({
+    id: z.string(),
+    displayName: z.string(),
+    description: z.string().optional(),
+    isDefault: z.boolean(),
+    /** e.g. low / medium / high. Empty when the model has no effort setting. */
+    reasoningEfforts: z.array(z.string()),
+    defaultReasoningEffort: z.string().optional(),
+    /** Provider-advertised routing tiers, such as Codex's priority/Fast tier. */
+    serviceTiers: z
+        .array(z.object({
+        id: z.string(),
+        name: z.string(),
+        description: z.string(),
+    }))
+        .default([]),
+    defaultServiceTier: z.string().nullable().optional(),
+});
+/**
+ * The small model TasteCode uses for short product-owned writing such as thread
+ * titles and commit-message drafts. Source identity stays explicit because
+ * model ids are not globally unique across custom harnesses.
+ */
+export const BackgroundModelTargetSchema = z.object({
+    provider: ProviderIdSchema,
+    agent: z.string().min(1).optional(),
+    model: z.string().min(1),
+    effort: z.string().min(1).optional(),
+    serviceTier: z.string().min(1).optional(),
+});
+export const BackgroundModelPreferenceSchema = z.discriminatedUnion('mode', [
+    z.object({ mode: z.literal('automatic') }),
+    z.object({ mode: z.literal('manual'), target: BackgroundModelTargetSchema }),
+]);
+export const BackgroundModelSourceSchema = z.object({
+    id: z.string().min(1),
+    displayName: z.string().min(1),
+    provider: ProviderIdSchema,
+    agent: z.string().min(1).optional(),
+    models: z.array(ModelSchema),
+});
+export const BackgroundModelSelectionSchema = BackgroundModelTargetSchema.extend({
+    sourceName: z.string().min(1),
+    automatic: z.boolean(),
+});
+export const BackgroundModelSettingsSchema = z.object({
+    preference: BackgroundModelPreferenceSchema,
+    sources: z.array(BackgroundModelSourceSchema),
+    resolved: BackgroundModelSelectionSchema.optional(),
+});
+/**
+ * How much the agent may do without asking. Mapped per adapter onto whatever
+ * the engine calls it — this is the user-facing concept, and it is the single
+ * most consequential setting in the app, so it is never hidden in a menu.
+ */
+export const ApprovalModeSchema = z.enum(['ask', 'auto', 'auto-review', 'full']);
+/**
+ * Context settings the server applies to every session it launches or resumes
+ * with one provider. Absent fields leave the engine's own behaviour alone.
+ */
+export const ProviderContextSettingsSchema = z.object({
+    /** Tokens the session may hold. Must be one of the provider's declared windows. */
+    window: z.number().int().positive().optional(),
+    /** Percent of the window at which the engine compacts on its own, or never. */
+    compactAt: z.union([z.number().int().min(10).max(99), z.literal('off')]).optional(),
+});
+/**
+ * Who the user is signed in as with a given provider.
+ *
+ * We learn this by asking the provider's own binary. We never read its
+ * credential files — see rules/security.md.
+ */
+export const AccountSchema = z.object({
+    signedIn: z.boolean(),
+    email: z.string().optional(),
+    /** Vendor's own plan name: plus, pro, team, business, enterprise, api-key… */
+    plan: z.string().optional(),
+});
+/** Actionable setup information supplied by the provider adapter. */
+export const ProviderSetupSchema = z.object({
+    installUrl: z.url(),
+    installCommand: z.string().optional(),
+    /** `app` can authenticate in Harness; `provider` finishes setup in the provider's CLI. */
+    login: z.enum(['app', 'provider']),
+    /** Whether the provider CLI opens its own OAuth page during terminal sign-in. */
+    loginOpensBrowser: z.boolean().optional(),
+});
+/**
+ * A user-owned CLI that speaks one of the protocols Harness already knows.
+ * `command` is an executable name on PATH or an absolute executable path;
+ * fixed argv entries stay separate so paths and values containing spaces are
+ * never re-parsed through a shell.
+ */
+export const CustomHarnessSchema = z.object({
+    id: z.string().trim().min(1).max(128),
+    displayName: z.string().trim().min(1).max(80),
+    provider: z.enum(['codex', 'claude-code', 'grok']),
+    command: z
+        .string()
+        .trim()
+        .min(1)
+        .max(4096)
+        .refine((value) => !value.includes('\0'), 'command cannot contain a null byte'),
+    args: z
+        .array(z
+        .string()
+        .max(4096)
+        .refine((value) => !value.includes('\0'), 'argument cannot contain a null byte'))
+        .max(64),
+    /**
+     * Optional launcher cwd. The active project remains available to wrappers
+     * as HARNESS_WORKSPACE_PATH even when a mod has to boot from its own source
+     * directory.
+     */
+    workingDirectory: z
+        .string()
+        .trim()
+        .min(1)
+        .max(4096)
+        .refine((value) => !value.includes('\0'), 'working directory cannot contain a null byte')
+        .optional(),
+    /** Non-secret process settings such as an isolated state/config directory. */
+    environment: z
+        .record(z
+        .string()
+        .trim()
+        .min(1)
+        .max(128)
+        .refine((value) => !value.includes('=') && !value.includes('\0'), 'invalid environment key'), z
+        .string()
+        .max(8192)
+        .refine((value) => !value.includes('\0'), 'environment value cannot contain a null byte'))
+        .refine((value) => Object.keys(value).length <= 64, 'too many environment entries')
+        .optional(),
+});
+export const CustomHarnessVerificationCheckSchema = z.object({
+    label: z.string().min(1),
+    status: z.enum(['passed', 'warning', 'failed']),
+    detail: z.string().min(1),
+});
+export const CustomHarnessVerificationSchema = z.object({
+    status: z.enum(['ready', 'warning', 'error']),
+    summary: z.string().min(1),
+    checkedAt: z.number().int().nonnegative(),
+    resolvedCommand: z.string().min(1).optional(),
+    checks: z.array(CustomHarnessVerificationCheckSchema).min(1),
+});
+export const ProviderStatusSchema = z.object({
+    id: ProviderIdSchema,
+    displayName: z.string(),
+    installed: z.boolean(),
+    /** Version string reported by the vendor binary, when we could read one. */
+    version: z.string().optional(),
+    /**
+     * We ask the vendor binary; we never inspect its credential files.
+     * `unknown` means the binary could not tell us.
+     */
+    auth: z.enum(['authenticated', 'unauthenticated', 'unknown']),
+    capabilities: CapabilitiesSchema.optional(),
+    setup: ProviderSetupSchema.optional(),
+    /** Why it is unusable, in language we can show the user directly. */
+    problem: z.string().optional(),
+});
+/** Public release metadata; update commands remain on the server. */
+export const ProviderUpdateSchema = z.object({
+    provider: ProviderIdSchema,
+    displayName: z.string(),
+    currentVersion: z.string().optional(),
+    latestVersion: z.string().optional(),
+    updateAvailable: z.boolean(),
+    canUpdate: z.boolean(),
+    updateUrl: z.url(),
+    error: z.string().optional(),
+});
+//# sourceMappingURL=domain.js.map

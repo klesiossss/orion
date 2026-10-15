@@ -1,0 +1,127 @@
+const BROWSER_PARTITION = 'persist:harness-browser';
+const configuredSessions = new WeakSet();
+/**
+ * Configure renderer-owned <webview> guests before any remote content is
+ * attached. The page lives in Chromium's guest process, while the UI remains a
+ * normal DOM element that follows the sidebar's layout without native overlays.
+ */
+export function configureEmbeddedBrowser(owner) {
+    owner.on('will-attach-webview', (event, webPreferences, params) => {
+        delete webPreferences.preload;
+        webPreferences.allowRunningInsecureContent = false;
+        // Guest pages are arbitrary sites and dev servers. Like a background tab,
+        // they should not run timers and animation frames at full rate while the
+        // app window is hidden or minimized. Hidden preview captures use their own
+        // unthrottled window.
+        webPreferences.backgroundThrottling = true;
+        webPreferences.contextIsolation = true;
+        webPreferences.navigateOnDragDrop = false;
+        webPreferences.nodeIntegration = false;
+        webPreferences.nodeIntegrationInSubFrames = false;
+        webPreferences.nodeIntegrationInWorker = false;
+        webPreferences.partition = BROWSER_PARTITION;
+        webPreferences.plugins = false;
+        webPreferences.sandbox = true;
+        webPreferences.spellcheck = false;
+        webPreferences.webSecurity = true;
+        // A guest with webviewTag could nest webviews whose will-attach-webview
+        // fires on the guest's own webContents — outside this hardening listener.
+        webPreferences.webviewTag = false;
+        if (!isBrowserGuestUrl(params['src'], true))
+            event.preventDefault();
+    });
+    owner.on('did-attach-webview', (_event, guest) => {
+        configureBrowserSession(guest.session);
+        guest.setUserAgent(browserUserAgent(guest.getUserAgent()));
+        guest.setWindowOpenHandler(({ url, postBody, referrer }) => {
+            if (isBrowserGuestUrl(url)) {
+                const navigation = postBody
+                    ? guest.loadURL(url, {
+                        postData: postBody.data,
+                        httpReferrer: referrer,
+                        extraHeaders: `Content-Type: ${postBody.contentType}${postBody.boundary ? `; boundary=${postBody.boundary}` : ''}`,
+                    })
+                    : guest.loadURL(url);
+                void navigation.catch((error) => {
+                    console.warn('[browser] failed to open guest link', error);
+                });
+            }
+            return { action: 'deny' };
+        });
+        guest.on('will-navigate', (event, url) => {
+            if (!isBrowserGuestUrl(url))
+                event.preventDefault();
+        });
+        guest.on('will-redirect', (event, url) => {
+            if (!isBrowserGuestUrl(url))
+                event.preventDefault();
+        });
+        // A guest that still ends up off the web gets unloaded.
+        guest.on('did-navigate', (_event, url) => {
+            if (!isBrowserGuestUrl(url, true)) {
+                void guest.loadURL('about:blank').catch(() => { });
+            }
+        });
+    });
+}
+export function browserGuestUrl(value) {
+    if (typeof value !== 'string' || !isBrowserGuestUrl(value)) {
+        throw new Error('Invalid browser URL');
+    }
+    return value;
+}
+function isBrowserGuestUrl(value, allowBlank = false) {
+    if (typeof value !== 'string')
+        return false;
+    if (allowBlank && value === 'about:blank')
+        return true;
+    try {
+        const url = new URL(value);
+        if (url.protocol === 'https:')
+            return true;
+        // Plain HTTP stays loopback-only: dev previews bind 127.0.0.1 (see
+        // LoopbackPreviewUrlSchema), while unrestricted HTTP would let a guest
+        // page pull link-local metadata endpoints or LAN services into this
+        // shared session.
+        return url.protocol === 'http:' && isLoopbackHostname(url.hostname);
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * WHATWG parsing already normalizes non-decimal IPv4 spellings, trailing-dot
+ * IPs and compressed IPv6 literals, so string checks cover every loopback
+ * spelling a URL can carry.
+ */
+function isLoopbackHostname(hostname) {
+    if (hostname === '[::1]')
+        return true;
+    if (/^127(?:\.\d{1,3}){3}$/.test(hostname))
+        return true;
+    const domain = hostname.endsWith('.') ? hostname.slice(0, -1) : hostname;
+    return domain === 'localhost' || domain.endsWith('.localhost');
+}
+/** Present the guest as Chromium instead of exposing the Electron shell. */
+export function browserUserAgent(value) {
+    return value
+        .replace(/\sElectron\/[\w.-]+/gi, '')
+        .replace(/\s(?:TasteCode|PersonalHarness|@harness\/desktop)\/[\w.-]+/gi, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+}
+function configureBrowserSession(browserSession) {
+    if (configuredSessions.has(browserSession))
+        return;
+    configuredSessions.add(browserSession);
+    // Programmatic loadURL/src changes skip will-navigate. Cancel through the
+    // request API: stopping inside did-start-navigation can crash Chromium.
+    browserSession.webRequest.onBeforeRequest((details, callback) => {
+        callback({
+            cancel: details.resourceType === 'mainFrame' && !isBrowserGuestUrl(details.url, true),
+        });
+    });
+    browserSession.setPermissionCheckHandler(() => false);
+    browserSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+}
+//# sourceMappingURL=embedded-browser.js.map

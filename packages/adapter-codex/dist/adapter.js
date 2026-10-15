@@ -1,0 +1,1427 @@
+import { EventEmitter } from 'node:events';
+import { UserInputRequestSchema } from '@harness/contracts';
+import { mapThreadItem } from './map-item.js';
+import { spawnCli, StdioJsonRpc, } from '@harness/proc';
+import { z, ZodError } from 'zod';
+import { CODEX_CAPABILITIES } from './capabilities.js';
+import { mapMcpServerStatus, mapMcpStartupStatus, mcpShellEnvironmentConfig, mcpStartupInventory, prepareMcpConfig, } from './mcp.js';
+import { mapSkillList } from './skills.js';
+import { AccountLoginCompletedNotificationSchema, AccountResponseSchema, ApprovalParamsSchema, CodexRateLimitResponseSchema, CodexResetCreditSchema, ConsumeRateLimitResetResponseSchema, CommandOutputDeltaNotificationSchema, ErrorNotificationSchema, GuardianReviewCompletedSchema, GuardianReviewStartedSchema, ItemCompletedNotificationSchema, ItemDeltaNotificationSchema, ItemStartedNotificationSchema, ListMcpServerStatusResponseSchema, LoginAccountResponseSchema, McpServerOauthLoginCompletedNotificationSchema, McpServerOauthLoginResponseSchema, McpServerStatusUpdatedNotificationSchema, McpToolApprovalParamsSchema, ModelListResponseSchema, PermissionsRequestApprovalParamsSchema, ReasoningSummaryPartAddedNotificationSchema, SkillsConfigWriteResponseSchema, SkillsListResponseSchema, ThreadResumeResponseSchema, ThreadStartResponseSchema, ThreadStartedNotificationSchema, ThreadTokenUsageUpdatedNotificationSchema, ToolRequestUserInputParamsSchema, TurnCompletedNotificationSchema, TurnDiffUpdatedNotificationSchema, TurnPlanUpdatedNotificationSchema, TurnStartedNotificationSchema, TurnStartResponseSchema, WarningNotificationSchema, } from './schemas.js';
+export { CODEX_CAPABILITIES } from './capabilities.js';
+/**
+ * Tier 1 adapter: drives `codex app-server` over JSON-RPC.
+ *
+ * This is the richest integration any vendor offers, which is why it is the
+ * first one built — designing the internal domain model against the best
+ * available protocol keeps it from collapsing to a lowest common denominator.
+ *
+ * Note what this adapter does NOT do: it never reads `~/.codex/auth.json` or
+ * any other credential. The binary authenticates itself. See rules/security.md.
+ */
+const CLIENT_NAME = 'tastecode';
+const CONTROL_READ_TIMEOUT_MS = 10_000;
+const INITIALIZE_TIMEOUT_MS = 30_000;
+const THREAD_START_TIMEOUT_MS = 30_000;
+const ServerRequestResolvedSchema = z.object({
+    threadId: z.string(),
+    requestId: z.union([z.number(), z.string()]),
+});
+const ServerRequestContextSchema = z.object({
+    threadId: z.string().optional(),
+    turnId: z.string().optional(),
+});
+const IGNORABLE_NOTIFICATIONS = new Set([
+    'remoteControl/status/changed',
+    'thread/status/changed',
+    // Account state is read on demand through account/read, and sign-in results
+    // already arrive as account/login/completed.
+    'account/updated',
+    // The app-server writes the same warning to stderr, which is already
+    // forwarded to the log; mapping this too would print every warning twice.
+    'configWarning',
+    // Experimental, and not guaranteed to add up to the plan item that completes it.
+    'item/plan/delta',
+]);
+/** Provider state TasteCode either does not expose or already derives from shared events. */
+export function isIgnorableCodexNotification(method) {
+    return IGNORABLE_NOTIFICATIONS.has(method);
+}
+export function formatCodexWarning(notification) {
+    return `Codex warning: ${notification.message}`;
+}
+export function mapCodexError(notification) {
+    if (notification.willRetry)
+        return undefined;
+    return {
+        type: 'thread.error',
+        threadId: notification.threadId,
+        message: notification.error.message,
+    };
+}
+export function mapCodexUsage(notification, model) {
+    const total = notification.tokenUsage.total;
+    // Codex's total is cumulative spend; its last counter is context occupancy.
+    // Usage cannot carry both numerators, so exposing the window beside total
+    // would render an impossible context percentage after a few turns.
+    return {
+        ...(model ? { model } : {}),
+        inputTokens: total.inputTokens,
+        cachedInputTokens: total.cachedInputTokens,
+        outputTokens: total.outputTokens,
+        reasoningTokens: total.reasoningOutputTokens,
+        totalTokens: total.totalTokens,
+        cumulative: true,
+        inputIncludesCached: true,
+    };
+}
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
+function isImage(path) {
+    const dot = path.lastIndexOf('.');
+    return dot === -1 ? false : IMAGE_EXTENSIONS.has(path.slice(dot).toLowerCase());
+}
+function basename(path) {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return parts[parts.length - 1] ?? path;
+}
+/** Command output arrives base64-encoded because it is raw bytes, not text. */
+function decodeBase64(value) {
+    try {
+        return Buffer.from(value, 'base64').toString('utf8');
+    }
+    catch {
+        return '';
+    }
+}
+/**
+ * Codex takes both settings as config overrides, and counts the compaction
+ * point in tokens rather than as a share of the window.
+ */
+export function codexContextConfig(context) {
+    if (!context)
+        return {};
+    const window = context.window ?? CODEX_CAPABILITIES.context.windows[0];
+    return {
+        ...(context.window !== undefined ? { model_context_window: context.window } : {}),
+        ...(typeof context.compactAt === 'number'
+            ? { model_auto_compact_token_limit: Math.round((window * context.compactAt) / 100) }
+            : {}),
+    };
+}
+/**
+ * Our four user-facing modes onto Codex's approval policy and sandbox.
+ *
+ * `full` is genuinely dangerous, which is why the UI never makes it the quiet
+ * default and never remembers it silently across sessions.
+ */
+export const CODEX_APPROVAL = {
+    ask: { approvalPolicy: 'untrusted', sandbox: 'read-only', approvalsReviewer: 'user' },
+    auto: { approvalPolicy: 'on-request', sandbox: 'workspace-write', approvalsReviewer: 'user' },
+    'auto-review': {
+        approvalPolicy: 'on-request',
+        sandbox: 'workspace-write',
+        approvalsReviewer: 'auto_review',
+    },
+    full: { approvalPolicy: 'never', sandbox: 'danger-full-access', approvalsReviewer: 'user' },
+};
+const REVIEW_STATUS = {
+    inProgress: 'in_progress',
+    approved: 'approved',
+    denied: 'denied',
+    timedOut: 'timed_out',
+    aborted: 'aborted',
+};
+/** Codex sends blank strings rather than omitting text, so blank counts as missing. */
+function presentText(text) {
+    return text.trim() ? text : undefined;
+}
+/**
+ * Codex's wire schema allows blank text and any timeout; the shared contract
+ * does not, and every consumer drops a request that fails it. Blank text is
+ * filled from its neighbour, unlabelled options are dropped, and a timeout
+ * the contract cannot carry is left out. Ids are answer keys Codex matches,
+ * so they are never invented; the caller rejects what still does not fit.
+ */
+export function mapUserInputRequest(params) {
+    const autoResolutionMs = UserInputRequestSchema.shape.autoResolutionMs.safeParse(params.autoResolutionMs);
+    return {
+        id: params.itemId,
+        turnId: params.turnId,
+        questions: params.questions.map((question) => {
+            const header = presentText(question.header);
+            const text = presentText(question.question);
+            return {
+                id: question.id,
+                header: header ?? text ?? '',
+                question: text ?? header ?? '',
+                allowOther: question.isOther,
+                secret: question.isSecret,
+                options: question.options?.flatMap(({ label, description }) => presentText(label) ? [{ label, description: presentText(description) ?? label }] : []) ?? null,
+            };
+        }),
+        autoResolutionMs: autoResolutionMs.success ? autoResolutionMs.data : null,
+        createdAt: Date.now(),
+    };
+}
+function describeApprovalReviewAction(action) {
+    switch (action.type) {
+        case 'command':
+            return `Run ${action.command}`;
+        case 'execve':
+            return `Run ${[action.program, ...action.argv].join(' ')}`;
+        case 'applyPatch':
+            return action.files.length === 1
+                ? `Edit ${action.files[0]}`
+                : `Edit ${action.files.length} files`;
+        case 'networkAccess':
+            return `Connect to ${action.target}`;
+        case 'mcpToolCall':
+            return `Use ${action.toolTitle ?? `${action.server}.${action.toolName}`}`;
+        case 'requestPermissions':
+            return action.reason
+                ? `Request extra permissions: ${action.reason}`
+                : 'Request extra permissions';
+    }
+}
+export function mapAutoApprovalReview(params) {
+    const completedAt = 'completedAtMs' in params ? params.completedAtMs : undefined;
+    return {
+        id: params.reviewId,
+        turnId: params.turnId,
+        status: REVIEW_STATUS[params.review.status],
+        description: describeApprovalReviewAction(params.action),
+        ...(params.review.rationale ? { rationale: params.review.rationale } : {}),
+        ...(params.review.riskLevel ? { riskLevel: params.review.riskLevel } : {}),
+        startedAt: params.startedAtMs,
+        ...(completedAt
+            ? {
+                completedAt: completedAt,
+            }
+            : {}),
+    };
+}
+/** The vendor's plan ids are not display strings. */
+function planLabel(plan) {
+    return PLAN_LABELS.find(([id]) => id === plan)?.[1] ?? 'Signed in';
+}
+const PLAN_LABELS = [
+    ['free', 'Free'],
+    ['go', 'Go'],
+    ['plus', 'Plus'],
+    ['pro', 'Pro x20'],
+    ['prolite', 'Pro x5'],
+    ['team', 'Team'],
+    ['business', 'Business'],
+    ['enterprise', 'Enterprise'],
+    ['edu', 'Edu'],
+];
+/**
+ * Models still in Codex's own catalog that `model/list` marks hidden. An id
+ * Codex has dropped from its catalog does not belong here, or the picker would
+ * keep offering a model Codex no longer ships.
+ */
+const CODEX_COMPATIBILITY_MODELS = [
+    codexCompatibilityModel('gpt-5.5', 'GPT-5.5', 'Legacy coding model.'),
+];
+function codexCompatibilityModel(id, displayName, description, defaultReasoningEffort = 'medium') {
+    return {
+        id,
+        displayName,
+        description,
+        isDefault: false,
+        reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+        defaultReasoningEffort,
+        serviceTiers: [],
+    };
+}
+/** Which server requests are approval prompts, and what they are about. */
+const APPROVAL_KIND = new Map([
+    ['item/commandExecution/requestApproval', 'command'],
+    ['item/fileChange/requestApproval', 'file_change'],
+    ['item/permissions/requestApproval', 'permissions'],
+    ['execCommandApproval', 'command'],
+    ['applyPatchApproval', 'file_change'],
+]);
+/**
+ * Our four answers onto Codex's per-kind decision vocabulary.
+ *
+ * `abort` maps to cancel, which stops the turn rather than just this step —
+ * "no, and stop" is a different intent from "not this one".
+ */
+const DECISION = {
+    command: {
+        approve: 'accept',
+        'approve-session': 'acceptForSession',
+        deny: 'decline',
+        abort: 'cancel',
+    },
+    file_change: {
+        approve: 'accept',
+        'approve-session': 'acceptForSession',
+        deny: 'decline',
+        abort: 'cancel',
+    },
+    permissions: {
+        approve: 'accept',
+        'approve-session': 'acceptForSession',
+        deny: 'decline',
+        abort: 'cancel',
+    },
+};
+export function mapApprovalResponse(kind, decision, requested) {
+    if (kind !== 'permissions') {
+        return { decision: DECISION[kind][decision] };
+    }
+    const permissions = {};
+    if (decision === 'approve' || decision === 'approve-session') {
+        if (requested?.network)
+            permissions['network'] = { enabled: requested.network.enabled };
+        if (requested?.fileSystem) {
+            const fileSystem = {
+                read: requested.fileSystem.read,
+                write: requested.fileSystem.write,
+                ...(requested.fileSystem.globScanMaxDepth === undefined
+                    ? {}
+                    : { globScanMaxDepth: requested.fileSystem.globScanMaxDepth }),
+                ...(requested.fileSystem.entries === undefined
+                    ? {}
+                    : { entries: requested.fileSystem.entries }),
+            };
+            permissions['fileSystem'] = fileSystem;
+        }
+    }
+    return {
+        permissions,
+        scope: decision === 'approve-session' ? 'session' : 'turn',
+    };
+}
+/**
+ * MCP tool approvals are elicitations, answered with an action. `cancel` only
+ * skips the tool in Codex, so aborting also interrupts the turn.
+ */
+const MCP_TOOL_ACTION = {
+    approve: 'accept',
+    'approve-session': 'accept',
+    deny: 'decline',
+    abort: 'cancel',
+};
+export function mapMcpToolApprovalResponse(decision, rememberForSession) {
+    return {
+        action: MCP_TOOL_ACTION[decision],
+        content: null,
+        _meta: decision === 'approve-session' && rememberForSession ? { persist: 'session' } : null,
+    };
+}
+export function mapMcpToolApprovalRequest(params) {
+    const toolParams = params._meta.tool_params;
+    const shownParams = toolParams === undefined || toolParams === null || JSON.stringify(toolParams) === '{}'
+        ? ''
+        : `\n${JSON.stringify(toolParams, null, 2)}`;
+    return {
+        id: crypto.randomUUID(),
+        kind: 'permissions',
+        ...(params._meta.tool_description ? { reason: params._meta.tool_description } : {}),
+        command: `${params.message}${shownParams}`,
+        createdAt: Date.now(),
+    };
+}
+function approvalReply(pending, decision) {
+    if (pending.mcpTool) {
+        return mapMcpToolApprovalResponse(decision, pending.mcpTool.rememberForSession);
+    }
+    return mapApprovalResponse(pending.kind, decision, pending.permissions);
+}
+export function mapApprovalRequest(input) {
+    const { kind, params } = input;
+    if (kind === 'permissions') {
+        return {
+            id: params.itemId,
+            kind,
+            ...(params.reason ? { reason: params.reason } : {}),
+            command: `Requested access:\n${JSON.stringify(params.permissions, null, 2)}`,
+            cwd: params.cwd,
+            createdAt: Date.now(),
+        };
+    }
+    return {
+        id: ('approvalId' in params ? params.approvalId : undefined) ??
+            params.itemId ??
+            crypto.randomUUID(),
+        kind,
+        ...(params.reason ? { reason: params.reason } : {}),
+        ...(params.command ? { command: params.command } : {}),
+        ...(params.cwd ? { cwd: String(params.cwd) } : {}),
+        ...(params.grantRoot ? { path: params.grantRoot } : {}),
+        createdAt: Date.now(),
+    };
+}
+export function permissionInterruptParams(threadId, turnId) {
+    return { threadId, turnId };
+}
+export class CodexAdapter extends EventEmitter {
+    #processStop = Promise.resolve();
+    #spawn;
+    #rpc;
+    #started = false;
+    #restartNeeded = false;
+    #starting;
+    #startupGeneration = 0;
+    #mcpStartup = new Map();
+    #mcpInventory = new Map();
+    #mcpInventoryLoads = new Map();
+    #threadModels = new Map();
+    #activeTurns = new Map();
+    #pendingTurnCompletions = new Set();
+    #sessionThread;
+    #mcpServers;
+    #mcpEnvironment;
+    #mcpShellConfig;
+    #mcpLogins = new Map();
+    /**
+     * Approvals waiting on an answer, keyed by our id. Holds the JSON-RPC
+     * responder because Codex is blocked on that specific request id.
+     */
+    #approvals = new Map();
+    #threadApprovals = new Map();
+    #userInputs = new Map();
+    constructor(options = {}) {
+        super();
+        this.#spawn = options.spawn ?? spawnCli;
+        const prepared = prepareMcpConfig(options.mcpServers ?? [], options.mcpCredentials ?? {});
+        this.#mcpServers = prepared.servers;
+        this.#mcpEnvironment = prepared.environment;
+        this.#mcpShellConfig = mcpShellEnvironmentConfig(prepared.environment);
+    }
+    get capabilities() {
+        return CODEX_CAPABILITIES;
+    }
+    /** Spawn the app-server and complete the handshake. Idempotent. */
+    start() {
+        if (this.#started)
+            return Promise.resolve();
+        if (this.#starting)
+            return this.#starting;
+        const generation = this.#startupGeneration;
+        this.#starting = (async () => {
+            await this.#settleProcessStop();
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                if (generation !== this.#startupGeneration)
+                    throw new Error('Codex startup was cancelled');
+                try {
+                    await this.#initialize();
+                    return;
+                }
+                catch (error) {
+                    if (attempt !== 0 ||
+                        generation !== this.#startupGeneration ||
+                        !(error instanceof Error) ||
+                        error.message !== 'Codex request timed out: initialize')
+                        throw error;
+                    this.emit('log', 'Codex initialization timed out; restarting the local process once.');
+                }
+            }
+        })().finally(() => {
+            this.#starting = undefined;
+        });
+        return this.#starting;
+    }
+    async #initialize() {
+        // Structured questions are gated in Codex's default collaboration mode.
+        // Enable the native tool at process startup so every advertised user-input
+        // capability is real rather than a request the model can never make.
+        const rpc = new StdioJsonRpc(this.#spawn('codex', ['app-server', '--enable', 'default_mode_request_user_input'], {
+            env: this.#mcpEnvironment,
+        }), 'Codex', {
+            // Resume replies include full history; a captured Design chat exceeded
+            // the shared 16 MiB frame limit. Keep a finite, history-sized allowance.
+            maxFrameBytes: 128 * 1024 * 1024,
+            onFailure: (error) => this.#onFailure(rpc, error),
+        });
+        this.#rpc = rpc;
+        rpc.onStderr((text) => this.emit('log', text.trimEnd()));
+        rpc.onNotification((method, params) => {
+            if (this.#rpc === rpc)
+                this.#onNotification(method, params);
+        });
+        rpc.onServerRequest((method, params, respond, rpcId) => {
+            if (this.#rpc === rpc)
+                this.#onServerRequest(method, params, respond, rpcId);
+        });
+        try {
+            await rpc.request('initialize', {
+                clientInfo: { name: CLIENT_NAME, title: 'TasteCode', version: '0.0.0' },
+                // thread/resume.excludeTurns requires this protocol capability.
+                capabilities: { experimentalApi: true },
+            }, { timeoutMs: INITIALIZE_TIMEOUT_MS });
+        }
+        catch (error) {
+            this.#processStop = Promise.resolve(rpc.dispose());
+            await this.#settleProcessStop();
+            if (this.#rpc === rpc)
+                this.#rpc = undefined;
+            throw error;
+        }
+        if (this.#rpc !== rpc)
+            throw new Error('Codex startup was cancelled');
+        rpc.notify('initialized', {});
+        if (this.#rpc !== rpc)
+            throw new Error('Codex startup was cancelled');
+        this.#started = true;
+        this.#restartNeeded = false;
+    }
+    /** A process that refused to stop is reported once, never left to block every restart. */
+    async #settleProcessStop() {
+        const stopping = this.#processStop;
+        try {
+            await stopping;
+        }
+        catch (cause) {
+            this.emit('log', `Previous Codex process did not stop: ${cause instanceof Error ? cause.message : String(cause)}`);
+            if (this.#processStop === stopping)
+                this.#processStop = Promise.resolve();
+        }
+    }
+    #onFailure(rpc, error) {
+        if (this.#rpc !== rpc)
+            return;
+        this.#rpc = undefined;
+        this.#started = false;
+        this.#restartNeeded = true;
+        this.#processStop = Promise.resolve(rpc.dispose());
+        this.#sessionThread = undefined;
+        this.#threadModels.clear();
+        this.#mcpStartup.clear();
+        this.#mcpInventory.clear();
+        this.#mcpInventoryLoads.clear();
+        this.#mcpLogins.clear();
+        const turns = [...this.#activeTurns];
+        this.#activeTurns.clear();
+        // The provider is gone: settle cards without replying to its dead requests.
+        for (const id of this.#approvals.keys()) {
+            this.#approvals.delete(id);
+            this.emit('event', { type: 'approval.resolved', id });
+        }
+        for (const id of this.#userInputs.keys()) {
+            this.#userInputs.delete(id);
+            this.emit('event', { type: 'user_input.resolved', id });
+        }
+        for (const [threadId, turnId] of turns) {
+            this.emit('event', { type: 'thread.error', threadId, message: error.message });
+            this.emit('event', { type: 'turn.completed', turnId, status: 'failed' });
+        }
+        this.emit('disconnected');
+    }
+    /**
+     * Who is signed in, asked of the binary itself.
+     *
+     * We never read ~/.codex/auth.json. The binary owns its credentials and
+     * answers questions about them; that is the whole compliance posture.
+     */
+    async account() {
+        const { account } = await this.#callParsed('account/read', {}, AccountResponseSchema);
+        if (!account)
+            return { signedIn: false };
+        switch (account.type) {
+            case 'apiKey':
+                return { signedIn: true, plan: 'API key' };
+            case 'chatgpt':
+                return {
+                    signedIn: true,
+                    ...(account.email ? { email: account.email } : {}),
+                    plan: planLabel(account.planType),
+                };
+            default:
+                return { signedIn: true };
+        }
+    }
+    /** Subscription availability and headroom, decided inside the adapter. */
+    async rateLimitSource() {
+        const { account } = await this.#callParsed('account/read', {}, AccountResponseSchema, CONTROL_READ_TIMEOUT_MS).catch((cause) => {
+            if (cause instanceof ZodError)
+                throw new Error('Codex account response was invalid.');
+            throw cause;
+        });
+        if (account?.type !== 'chatgpt')
+            return { status: 'unavailable' };
+        const response = await this.#callParsed('account/rateLimits/read', {}, CodexRateLimitResponseSchema, CONTROL_READ_TIMEOUT_MS).catch((cause) => {
+            if (cause instanceof ZodError)
+                throw new Error('Codex rate-limit response was invalid.');
+            throw cause;
+        });
+        return { status: 'ready', limits: mapCodexRateLimits(response) };
+    }
+    /** Compatibility view while the orchestrator migrates to the richer source state. */
+    async rateLimits() {
+        const source = await this.rateLimitSource();
+        return source.status === 'ready' ? source.limits : [];
+    }
+    /**
+     * Spend one earned reset. The caller owns the idempotency key so a retry of
+     * the same attempt cannot redeem a second credit.
+     */
+    async consumeRateLimitReset(idempotencyKey, creditId) {
+        const response = await this.#callParsed('account/rateLimitResetCredit/consume', { idempotencyKey, ...(creditId === undefined ? {} : { creditId }) }, ConsumeRateLimitResetResponseSchema, CONTROL_READ_TIMEOUT_MS).catch((cause) => {
+            if (cause instanceof ZodError)
+                throw new Error('Codex reset-credit response was invalid.');
+            throw cause;
+        });
+        return response.outcome;
+    }
+    onUsageChanged(listener) {
+        this.on('usageChanged', listener);
+    }
+    onMcpChanged(listener) {
+        this.on('mcpChanged', listener);
+        return () => this.off('mcpChanged', listener);
+    }
+    onDisconnected(listener) {
+        this.on('disconnected', listener);
+        return () => this.off('disconnected', listener);
+    }
+    /**
+     * Starts the vendor's own OAuth flow. Returns the URL to open in a browser —
+     * the user authenticates on OpenAI's site, not in our window, and we are
+     * never in a position to see the credential.
+     */
+    async startLogin() {
+        const response = await this.#callParsed('account/login/start', { type: 'chatgpt' }, LoginAccountResponseSchema);
+        if (response.type !== 'chatgpt')
+            throw new Error('unexpected login response');
+        return { loginId: response.loginId, authUrl: response.authUrl };
+    }
+    async cancelLogin(loginId) {
+        await this.#call('account/login/cancel', { loginId });
+    }
+    /** Bring-your-own-key. The key is the user's to use with any client. */
+    async useApiKey(apiKey) {
+        await this.#call('account/login/start', { type: 'apiKey', apiKey });
+        return this.account();
+    }
+    async signOut() {
+        await this.#call('account/logout', {});
+    }
+    /**
+     * The real catalogue, from the provider. We never ship a hardcoded model list
+     * — vendors add models constantly and a stale dropdown is worse than none.
+     */
+    async listModels() {
+        const response = await this.#callParsed('model/list', {}, ModelListResponseSchema);
+        const models = response.data
+            .filter((model) => !model.hidden && model.id !== 'gpt-5.2')
+            .map((model) => ({
+            id: model.id,
+            displayName: model.displayName,
+            ...(model.description ? { description: model.description } : {}),
+            isDefault: model.isDefault,
+            reasoningEfforts: model.supportedReasoningEfforts.map((option) => String(option.reasoningEffort)),
+            ...(model.defaultReasoningEffort
+                ? {
+                    defaultReasoningEffort: String(model.defaultReasoningEffort),
+                }
+                : {}),
+            serviceTiers: model.serviceTiers.map((tier) => ({
+                id: String(tier.id),
+                name: String(tier.name),
+                description: String(tier.description),
+            })),
+            ...(model.defaultServiceTier
+                ? {
+                    defaultServiceTier: String(model.defaultServiceTier),
+                }
+                : {}),
+        }));
+        // Codex hides legacy models from model/list while still running them, so a
+        // chat saved on one would otherwise lose its model. Live rows win.
+        for (const compatibilityModel of CODEX_COMPATIBILITY_MODELS) {
+            if (!models.some((model) => model.id === compatibilityModel.id)) {
+                models.push(compatibilityModel);
+            }
+        }
+        // Codex's own catalog priority (codex-cli 0.154). Unlisted rows keep their
+        // model/list order after these, and the legacy fallback stays last.
+        const preferred = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+        return models.sort((left, right) => {
+            const leftRank = preferred.indexOf(left.id);
+            const rightRank = preferred.indexOf(right.id);
+            return ((leftRank < 0 ? preferred.length : leftRank) -
+                (rightRank < 0 ? preferred.length : rightRank));
+        });
+    }
+    async listMcpServers(threadId) {
+        const key = threadId ?? '';
+        const cached = this.#mcpInventory.get(key);
+        if (cached)
+            return cached;
+        if (!this.#mcpInventoryLoads.has(key)) {
+            const loading = this.#loadMcpServers(threadId)
+                .then((servers) => {
+                if (this.#mcpInventoryLoads.get(key) !== loading)
+                    return;
+                this.#mcpInventory.set(key, servers);
+                this.emit('mcpChanged', threadId ? { threadId } : {});
+            })
+                .catch((cause) => {
+                if (this.#mcpInventoryLoads.get(key) !== loading)
+                    return;
+                this.emit('log', `MCP inventory refresh failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+            })
+                .finally(() => {
+                if (this.#mcpInventoryLoads.get(key) === loading)
+                    this.#mcpInventoryLoads.delete(key);
+            });
+            this.#mcpInventoryLoads.set(key, loading);
+        }
+        return mcpStartupInventory(this.#mcpStartup, threadId);
+    }
+    async #loadMcpServers(threadId) {
+        const servers = [];
+        let cursor;
+        do {
+            const response = await this.#callParsed('mcpServerStatus/list', {
+                detail: 'full',
+                ...(threadId ? { threadId: threadId } : {}),
+                ...(cursor ? { cursor: cursor } : {}),
+            }, ListMcpServerStatusResponseSchema);
+            servers.push(...response.data.map((status) => mapMcpServerStatus(status, this.#mcpStartup.get(mcpStartupKey(threadId, status.name)))));
+            cursor = response.nextCursor ?? undefined;
+        } while (cursor);
+        return servers;
+    }
+    async listSkills(projectPath) {
+        const response = await this.#callParsed('skills/list', { cwds: [projectPath], forceReload: true }, SkillsListResponseSchema);
+        return mapSkillList(response, projectPath);
+    }
+    async setSkillEnabled(skillId, enabled) {
+        const response = await this.#callParsed('skills/config/write', { path: skillId, name: null, enabled }, SkillsConfigWriteResponseSchema);
+        return response.effectiveEnabled;
+    }
+    async startMcpOAuth(serverId, threadId) {
+        const response = await this.#callParsed('mcpServer/oauth/login', { name: serverId, threadId }, McpServerOauthLoginResponseSchema);
+        const loginId = crypto.randomUUID();
+        this.#mcpLogins.set(mcpLoginKey(threadId, serverId), loginId);
+        return { loginId, authUrl: response.authorizationUrl };
+    }
+    onMcpOAuth(listener) {
+        this.on('mcpOAuth', listener);
+    }
+    async startThread(workspacePath, options = {}) {
+        const approval = options.approval ? CODEX_APPROVAL[options.approval] : undefined;
+        const config = {
+            ...codexContextConfig(options.context),
+            ...(options.effort
+                ? {
+                    model_reasoning_effort: options.effort,
+                }
+                : {}),
+            ...(Object.keys(this.#mcpServers).length
+                ? {
+                    mcp_servers: this.#mcpServers,
+                }
+                : {}),
+            ...this.#mcpShellConfig,
+        };
+        const response = await this.#callParsed('thread/start', {
+            cwd: workspacePath,
+            ...(options.model ? { model: options.model } : {}),
+            ...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
+            ...(options.instructions
+                ? {
+                    developerInstructions: options.instructions,
+                }
+                : {}),
+            ...(options.ephemeral !== undefined
+                ? {
+                    ephemeral: options.ephemeral,
+                }
+                : {}),
+            ...(Object.keys(config).length ? { config } : {}),
+            ...approval,
+        }, ThreadStartResponseSchema, THREAD_START_TIMEOUT_MS);
+        this.#threadModels.set(response.thread.id, response.model);
+        if (options.approval)
+            this.#threadApprovals.set(response.thread.id, options.approval);
+        const thread = {
+            id: response.thread.id,
+            provider: 'codex',
+            workspacePath,
+            createdAt: Date.now(),
+        };
+        this.#sessionThread = { id: thread.id, workspacePath };
+        return thread;
+    }
+    async resumeThread(threadId, workspacePath, options = {}) {
+        const approval = options.approval ? CODEX_APPROVAL[options.approval] : undefined;
+        const config = {
+            ...codexContextConfig(options.context),
+            ...(Object.keys(this.#mcpServers).length ? { mcp_servers: this.#mcpServers } : {}),
+            ...this.#mcpShellConfig,
+        };
+        const response = await this.#callParsed('thread/resume', {
+            threadId,
+            cwd: workspacePath,
+            // We replay our own event log; full provider history can exceed the frame limit.
+            excludeTurns: true,
+            ...(options.instructions
+                ? {
+                    developerInstructions: options.instructions,
+                }
+                : {}),
+            ...approval,
+            ...(Object.keys(config).length ? { config } : {}),
+        }, ThreadResumeResponseSchema);
+        this.#threadModels.set(response.thread.id, response.model);
+        if (options.approval)
+            this.#threadApprovals.set(response.thread.id, options.approval);
+        const thread = {
+            id: response.thread.id,
+            provider: 'codex',
+            workspacePath,
+            // Codex reports seconds; guard against it ever switching to millis,
+            // which the blind ×1000 would launch fifty millennia into the future.
+            createdAt: response.thread.createdAt < 100_000_000_000
+                ? response.thread.createdAt * 1_000
+                : response.thread.createdAt,
+        };
+        this.#sessionThread = { id: thread.id, workspacePath };
+        return thread;
+    }
+    async setApproval(approval) {
+        const thread = this.#sessionThread;
+        if (!thread)
+            throw new Error('no active Codex thread');
+        // Resuming an already-loaded thread ignores configuration overrides.
+        // Apply the selected policy on the next turn, including queued turns.
+        this.#threadApprovals.set(thread.id, approval);
+    }
+    async sendTurn(threadId, text, attachments = [], options = {}) {
+        if (!this.#threadModels.has(threadId)) {
+            throw new Error('Start or resume the Codex thread before sending another turn');
+        }
+        const rpc = this.#rpc;
+        const mode = this.#threadApprovals.get(threadId);
+        const approval = mode ? CODEX_APPROVAL[mode] : undefined;
+        const sandboxPolicy = mode === 'full'
+            ? { type: 'dangerFullAccess' }
+            : mode === 'ask'
+                ? { type: 'readOnly', networkAccess: false }
+                : {
+                    type: 'workspaceWrite',
+                    writableRoots: [],
+                    networkAccess: false,
+                    excludeTmpdirEnvVar: false,
+                    excludeSlashTmp: false,
+                };
+        const completed = new Set();
+        this.#pendingTurnCompletions.add(completed);
+        let response;
+        try {
+            response = await this.#callParsed('turn/start', {
+                threadId,
+                ...(approval
+                    ? {
+                        approvalPolicy: approval.approvalPolicy,
+                        approvalsReviewer: approval.approvalsReviewer,
+                        sandboxPolicy,
+                    }
+                    : {}),
+                ...(options.model ? { model: options.model } : {}),
+                ...(options.serviceTier
+                    ? {
+                        serviceTier: options.serviceTier,
+                    }
+                    : {}),
+                ...(options.effort ? { effort: options.effort } : {}),
+                input: [
+                    { type: 'text', text, text_elements: [] },
+                    // Images go in as images so the model can actually see them; anything
+                    // else becomes a mention, which is Codex's way of saying "this path is
+                    // relevant" without pushing the whole file into context.
+                    ...attachments.map((path) => isImage(path)
+                        ? { type: 'localImage', path }
+                        : { type: 'mention', name: basename(path), path }),
+                ],
+            }, TurnStartResponseSchema);
+        }
+        finally {
+            this.#pendingTurnCompletions.delete(completed);
+        }
+        if (this.#rpc !== rpc)
+            throw new Error('Codex disconnected while starting the turn; resume the thread');
+        if (!completed.has(response.turn.id) && !this.#activeTurns.has(threadId)) {
+            this.#activeTurns.set(threadId, response.turn.id);
+        }
+        if (options.model)
+            this.#threadModels.set(threadId, options.model);
+        return response.turn.id;
+    }
+    async interrupt(threadId) {
+        const turnId = this.#activeTurns.get(threadId);
+        if (!turnId)
+            throw new Error('there is no running Codex turn to interrupt');
+        await this.#call('turn/interrupt', { threadId, turnId });
+    }
+    /**
+     * Answer a pending approval.
+     *
+     * The reply goes back on the exact JSON-RPC request that asked, which is why
+     * the responder is held rather than the question re-derived — Codex is
+     * blocked waiting on that specific id.
+     */
+    respondToApproval(approvalId, decision) {
+        const pending = this.#approvals.get(approvalId);
+        if (!pending)
+            return;
+        this.#approvals.delete(approvalId);
+        pending.respond(approvalReply(pending, decision));
+        this.emit('event', { type: 'approval.resolved', id: approvalId });
+        if (pending.kind === 'permissions' &&
+            decision === 'abort' &&
+            pending.threadId &&
+            pending.turnId) {
+            void this.#call('turn/interrupt', permissionInterruptParams(pending.threadId, pending.turnId)).catch(() => this.emit('log', 'Codex permission abort failed to stop the turn'));
+        }
+    }
+    respondToUserInput(requestId, answers) {
+        const pending = this.#userInputs.get(requestId);
+        if (!pending)
+            return;
+        this.#userInputs.delete(requestId);
+        pending.respond({
+            answers: Object.fromEntries(Object.entries(answers).map(([questionId, values]) => [questionId, { answers: values }])),
+        });
+        this.emit('event', { type: 'user_input.resolved', id: requestId });
+    }
+    /** Inject input without restarting the turn. Codex is one of the few engines that can. */
+    async steer(threadId, text, attachments = []) {
+        const expectedTurnId = this.#activeTurns.get(threadId);
+        if (!expectedTurnId)
+            throw new Error('there is no running Codex turn to steer');
+        await this.#call('turn/steer', {
+            threadId,
+            expectedTurnId,
+            input: [
+                { type: 'text', text, text_elements: [] },
+                ...attachments.map((path) => isImage(path)
+                    ? { type: 'localImage', path }
+                    : { type: 'mention', name: basename(path), path }),
+            ],
+        });
+    }
+    dispose() {
+        this.#startupGeneration += 1;
+        const stopped = this.#rpc ? Promise.resolve(this.#rpc.dispose()) : this.#processStop;
+        this.#rpc = undefined;
+        this.#started = false;
+        this.#restartNeeded = false;
+        this.#mcpStartup.clear();
+        this.#mcpInventory.clear();
+        this.#mcpInventoryLoads.clear();
+        this.#threadModels.clear();
+        this.#threadApprovals.clear();
+        this.#activeTurns.clear();
+        this.#sessionThread = undefined;
+        // Held responders close over the dead transport; answering one after
+        // disposal would write into nothing. Drop them with the process.
+        this.#approvals.clear();
+        this.#userInputs.clear();
+        this.#mcpLogins.clear();
+        this.removeAllListeners();
+        this.#processStop = stopped;
+        return stopped;
+    }
+    async #readyRpc() {
+        if (this.#restartNeeded)
+            await this.start();
+        if (!this.#rpc)
+            throw new Error('adapter not started');
+        return this.#rpc;
+    }
+    async #call(method, params) {
+        const rpc = await this.#readyRpc();
+        const response = await rpc.request(method, params);
+        if (this.#rpc !== rpc)
+            throw new Error('Codex disconnected during the request');
+        return response;
+    }
+    async #callParsed(method, params, result, timeoutMs) {
+        const rpc = await this.#readyRpc();
+        const response = await rpc.request(method, params, {
+            result,
+            ...(timeoutMs ? { timeoutMs: timeoutMs } : {}),
+        });
+        if (this.#rpc !== rpc)
+            throw new Error('Codex disconnected during the request');
+        return response;
+    }
+    /**
+     * Codex asks permission by making a request of us, not by sending an event.
+     * Anything we do not recognise is declined — silently approving a request we
+     * could not even parse is the worst possible default.
+     */
+    #onServerRequest(method, params, respond, rpcId) {
+        if (method === 'item/tool/requestUserInput') {
+            const parsed = ToolRequestUserInputParamsSchema.parse(params);
+            // Consumers drop a request that fails the shared contract, so holding
+            // it would block Codex on a question nobody sees. Answer it with no
+            // answers, as a turn that ends unanswered does.
+            const mapped = UserInputRequestSchema.safeParse(mapUserInputRequest(parsed));
+            if (!mapped.success) {
+                this.emit('log', `answered an unusable Codex question with no answers: ${z.prettifyError(mapped.error)}`);
+                respond({ answers: {} });
+                return;
+            }
+            const request = mapped.data;
+            this.#userInputs.set(request.id, {
+                respond,
+                rpcId,
+                threadId: parsed.threadId,
+                turnId: parsed.turnId,
+            });
+            this.emit('event', { type: 'user_input.requested', request });
+            return;
+        }
+        if (method === 'mcpServer/elicitation/request') {
+            this.#onMcpElicitation(params, respond, rpcId);
+            return;
+        }
+        const kind = APPROVAL_KIND.get(method);
+        if (!kind) {
+            this.emit('log', `declined unhandled server request: ${method}`);
+            respond({ decision: 'decline' });
+            return;
+        }
+        const approval = kind === 'permissions'
+            ? { kind, params: PermissionsRequestApprovalParamsSchema.parse(params) }
+            : { kind, params: ApprovalParamsSchema.parse(params) };
+        const request = mapApprovalRequest(approval);
+        const permission = approval.kind === 'permissions' ? approval.params : undefined;
+        const context = ServerRequestContextSchema.parse(params);
+        const id = request.id;
+        // An id collision (a retried command reusing its itemId) would silently
+        // drop the earlier responder and leave Codex blocked on it forever.
+        const previous = this.#approvals.get(id);
+        if (previous) {
+            previous.respond(approvalReply(previous, 'deny'));
+            this.emit('event', { type: 'approval.resolved', id });
+        }
+        this.#approvals.set(id, {
+            kind,
+            respond,
+            rpcId,
+            ...(context.threadId ? { threadId: context.threadId } : {}),
+            ...(context.turnId ? { turnId: context.turnId } : {}),
+            ...(permission
+                ? {
+                    permissions: permission.permissions,
+                    threadId: permission.threadId,
+                }
+                : {}),
+            ...(permission ? { turnId: permission.turnId } : {}),
+        });
+        this.emit('event', { type: 'approval.requested', request });
+    }
+    /**
+     * Codex asks before an MCP tool call with an elicitation marked as an
+     * approval. Forms an MCP server starts itself have no card yet; they are
+     * declined in the elicitation shape, since Codex rejects any other reply.
+     */
+    #onMcpElicitation(params, respond, rpcId) {
+        const parsed = McpToolApprovalParamsSchema.safeParse(params);
+        if (!parsed.success) {
+            this.emit('log', 'declined unhandled server request: mcpServer/elicitation/request');
+            respond(mapMcpToolApprovalResponse('deny', false));
+            return;
+        }
+        const { threadId, _meta: meta } = parsed.data;
+        const turnId = parsed.data.turnId ?? this.#activeTurns.get(threadId);
+        const request = mapMcpToolApprovalRequest(parsed.data);
+        this.#approvals.set(request.id, {
+            kind: request.kind,
+            respond,
+            rpcId,
+            threadId,
+            ...(turnId ? { turnId } : {}),
+            mcpTool: {
+                rememberForSession: [meta.persist ?? []].flat().includes('session'),
+            },
+        });
+        this.emit('event', { type: 'approval.requested', request });
+    }
+    #onNotification(method, params) {
+        if (isIgnorableCodexNotification(method))
+            return;
+        const emit = (event) => this.emit('event', event);
+        switch (method) {
+            case 'serverRequest/resolved': {
+                const p = ServerRequestResolvedSchema.parse(params);
+                for (const [id, pending] of this.#approvals) {
+                    if (pending.rpcId !== p.requestId ||
+                        (pending.threadId !== undefined && pending.threadId !== p.threadId))
+                        continue;
+                    this.#approvals.delete(id);
+                    emit({ type: 'approval.resolved', id });
+                }
+                for (const [id, pending] of this.#userInputs) {
+                    if (pending.rpcId !== p.requestId || pending.threadId !== p.threadId)
+                        continue;
+                    this.#userInputs.delete(id);
+                    emit({ type: 'user_input.resolved', id });
+                }
+                return;
+            }
+            case 'skills/changed':
+                this.emit('skillsChanged');
+                return;
+            case 'thread/started': {
+                const p = ThreadStartedNotificationSchema.parse(params);
+                emit({
+                    type: 'thread.started',
+                    thread: {
+                        id: p.thread.id,
+                        provider: 'codex',
+                        workspacePath: String(p.thread.cwd ?? ''),
+                        createdAt: Date.now(),
+                    },
+                });
+                return;
+            }
+            case 'turn/started': {
+                const p = TurnStartedNotificationSchema.parse(params);
+                this.#activeTurns.set(p.threadId, p.turn.id);
+                emit({
+                    type: 'turn.started',
+                    turn: {
+                        id: p.turn.id,
+                        threadId: p.threadId,
+                        status: 'running',
+                        createdAt: Date.now(),
+                    },
+                });
+                return;
+            }
+            case 'turn/completed': {
+                const p = TurnCompletedNotificationSchema.parse(params);
+                const activeTurn = this.#activeTurns.get(p.threadId);
+                for (const completed of this.#pendingTurnCompletions)
+                    completed.add(p.turn.id);
+                if (this.#activeTurns.get(p.threadId) === p.turn.id)
+                    this.#activeTurns.delete(p.threadId);
+                // A turn that ends with unanswered approvals must not leave the
+                // thread pinned to 'approval' forever — the request is durably in
+                // the event log, so without a resolved event even a restart keeps
+                // the ghost card. Decline what nobody answered.
+                for (const [id, pending] of this.#approvals) {
+                    if ((pending.threadId !== undefined && pending.threadId !== p.threadId) ||
+                        (pending.turnId !== undefined && pending.turnId !== p.turn.id) ||
+                        (pending.turnId === undefined && activeTurn !== undefined && activeTurn !== p.turn.id))
+                        continue;
+                    this.#approvals.delete(id);
+                    pending.respond(approvalReply(pending, 'deny'));
+                    emit({ type: 'approval.resolved', id });
+                }
+                for (const [id, pending] of this.#userInputs) {
+                    if (pending.threadId !== p.threadId || pending.turnId !== p.turn.id)
+                        continue;
+                    this.#userInputs.delete(id);
+                    pending.respond({ answers: {} });
+                    emit({ type: 'user_input.resolved', id });
+                }
+                emit({
+                    type: 'turn.completed',
+                    turnId: p.turn.id,
+                    // `inProgress` should not reach us here, but map it rather than crash.
+                    status: p.turn.status === 'inProgress' ? 'completed' : p.turn.status,
+                });
+                return;
+            }
+            case 'item/started': {
+                const p = ItemStartedNotificationSchema.parse(params);
+                const item = mapThreadItem(p.item, {
+                    turnId: p.turnId,
+                    status: 'started',
+                    createdAt: p.startedAtMs,
+                });
+                emit({
+                    type: 'item.started',
+                    item,
+                });
+                return;
+            }
+            case 'item/completed': {
+                const p = ItemCompletedNotificationSchema.parse(params);
+                const item = mapThreadItem(p.item, {
+                    turnId: p.turnId,
+                    status: 'completed',
+                    createdAt: p.completedAtMs,
+                });
+                emit({
+                    type: 'item.completed',
+                    item,
+                });
+                return;
+            }
+            case 'item/autoApprovalReview/started': {
+                emit({
+                    type: 'approval.review.started',
+                    review: mapAutoApprovalReview(GuardianReviewStartedSchema.parse(params)),
+                });
+                return;
+            }
+            case 'item/autoApprovalReview/completed': {
+                emit({
+                    type: 'approval.review.completed',
+                    review: mapAutoApprovalReview(GuardianReviewCompletedSchema.parse(params)),
+                });
+                return;
+            }
+            case 'item/agentMessage/delta': {
+                const p = ItemDeltaNotificationSchema.parse(params);
+                emit({ type: 'item.delta', turnId: p.turnId, itemId: p.itemId, textDelta: p.delta });
+                return;
+            }
+            // Reasoning streams as its own delta channel. Without this the thinking
+            // row sits empty until the item completes, which reads as a hang.
+            case 'item/reasoning/summaryTextDelta':
+            case 'item/reasoning/textDelta': {
+                const p = ItemDeltaNotificationSchema.parse(params);
+                emit({ type: 'item.delta', turnId: p.turnId, itemId: p.itemId, textDelta: p.delta });
+                return;
+            }
+            // The completed item joins summary parts with a blank line; match it live.
+            case 'item/reasoning/summaryPartAdded': {
+                const p = ReasoningSummaryPartAddedNotificationSchema.parse(params);
+                if (p.summaryIndex > 0) {
+                    emit({ type: 'item.delta', turnId: p.turnId, itemId: p.itemId, textDelta: '\n\n' });
+                }
+                return;
+            }
+            // Command output, live. A build that prints for a minute should show it
+            // printing, not a spinner and then a wall of text.
+            case 'item/commandExecution/outputDelta': {
+                const p = CommandOutputDeltaNotificationSchema.parse(params);
+                const text = p.delta ?? (p.deltaBase64 ? decodeBase64(p.deltaBase64) : '');
+                if (text)
+                    emit({ type: 'item.delta', turnId: p.turnId, itemId: p.itemId, textDelta: text });
+                return;
+            }
+            case 'turn/plan/updated': {
+                const p = TurnPlanUpdatedNotificationSchema.parse(params);
+                emit({
+                    type: 'plan.updated',
+                    turnId: p.turnId,
+                    steps: p.plan.map((entry) => ({
+                        text: entry.step,
+                        status: entry.status === 'completed'
+                            ? 'done'
+                            : entry.status === 'inProgress'
+                                ? 'running'
+                                : 'pending',
+                    })),
+                });
+                return;
+            }
+            case 'turn/diff/updated': {
+                const p = TurnDiffUpdatedNotificationSchema.parse(params);
+                emit({ type: 'diff.updated', turnId: p.turnId, diff: p.diff });
+                return;
+            }
+            case 'thread/tokenUsage/updated': {
+                const p = ThreadTokenUsageUpdatedNotificationSchema.parse(params);
+                emit({
+                    type: 'usage.updated',
+                    usage: mapCodexUsage(p, this.#threadModels.get(p.threadId)),
+                });
+                return;
+            }
+            case 'account/login/completed': {
+                const p = AccountLoginCompletedNotificationSchema.parse(params);
+                this.emit('login', p);
+                return;
+            }
+            case 'account/rateLimits/updated':
+                this.emit('usageChanged');
+                return;
+            case 'warning':
+                this.emit('log', formatCodexWarning(WarningNotificationSchema.parse(params)));
+                return;
+            case 'error': {
+                const p = ErrorNotificationSchema.parse(params);
+                const event = mapCodexError(p);
+                if (event)
+                    emit(event);
+                else
+                    this.emit('log', `Codex retrying after error: ${p.error.message}`);
+                return;
+            }
+            case 'mcpServer/startupStatus/updated': {
+                const p = McpServerStatusUpdatedNotificationSchema.parse(params);
+                this.#mcpStartup.set(mcpStartupKey(p.threadId ?? undefined, p.name), mapMcpStartupStatus(p));
+                const inventory = this.#mcpInventory.get(p.threadId ?? '');
+                if (p.status === 'ready') {
+                    // A server that just connected reports tools and auth the cached copy lacks.
+                    this.#mcpInventory.delete(p.threadId ?? '');
+                    this.#mcpInventoryLoads.delete(p.threadId ?? '');
+                }
+                else if (inventory) {
+                    this.#mcpInventory.set(p.threadId ?? '', inventory.map((server) => server.id === p.name ? { ...server, startup: mapMcpStartupStatus(p) } : server));
+                }
+                this.emit('mcpChanged', p.threadId ? { threadId: p.threadId } : {});
+                return;
+            }
+            case 'mcpServer/oauthLogin/completed': {
+                const p = McpServerOauthLoginCompletedNotificationSchema.parse(params);
+                if (p.success) {
+                    // The sign-in is the server's, not one chat's: every cached copy is stale.
+                    this.#mcpInventory.clear();
+                    this.#mcpInventoryLoads.clear();
+                }
+                // A completion without a threadId still ends someone's login — match
+                // by server name across threads rather than leaving the browser flow
+                // finished and the UI waiting forever.
+                const key = p.threadId
+                    ? mcpLoginKey(p.threadId, p.name)
+                    : [...this.#mcpLogins.keys()].find((candidate) => candidate.endsWith(`\0${p.name}`));
+                const loginId = key ? this.#mcpLogins.get(key) : undefined;
+                if (!key || !loginId)
+                    return;
+                this.#mcpLogins.delete(key);
+                this.emit('mcpOAuth', {
+                    serverId: p.name,
+                    loginId,
+                    success: p.success,
+                    error: p.error ?? null,
+                });
+                return;
+            }
+            default:
+                // Codex emits far more than we consume (realtime audio, MCP progress,
+                // etc.). Ignoring the rest is correct; logging it is how we
+                // notice when something worth mapping appears.
+                this.emit('log', `unmapped notification: ${method}`);
+        }
+    }
+}
+function mcpStartupKey(threadId, server) {
+    return `${threadId ?? ''}\0${server}`;
+}
+function mcpLoginKey(threadId, server) {
+    return `${threadId}\0${server}`;
+}
+/** Same USD-per-credit rate OpenAI's own surfaces use. */
+const CREDIT_USD_RATE = 0.04;
+/** Pure mapping kept separate from the app-server transport for fixture tests. */
+export function mapCodexRateLimits(response) {
+    const buckets = response.rateLimitsByLimitId
+        ? Object.entries(response.rateLimitsByLimitId).filter((pair) => Boolean(pair[1]))
+        : [];
+    if (response.rateLimits && !buckets.some(([limitId]) => limitId === 'codex')) {
+        buckets.unshift(['codex', response.rateLimits]);
+    }
+    // Ensure the main codex bucket always appears first.
+    buckets.sort(([a], [b]) => (a === 'codex' ? -1 : b === 'codex' ? 1 : 0));
+    const rows = [];
+    for (const [limitId, snapshot] of buckets) {
+        // Secondary buckets (e.g. Spark) carry their own name; the main
+        // bucket falls back to the plain window label.
+        const prefix = limitId === 'codex' ? '' : `${snapshot.limitName ?? titleCaseLimitId(limitId)} `;
+        rows.push(...[snapshot.primary, snapshot.secondary].flatMap((window, index) => {
+            if (!window)
+                return [];
+            const usedPercent = finitePercent(window.usedPercent);
+            if (usedPercent === undefined)
+                return [];
+            const resetsAt = resetTimestamp(window.resetsAt);
+            return [
+                {
+                    label: friendlyLimitLabel(limitId, snapshot.limitName, window.windowDurationMins) ??
+                        prefix +
+                            rateLimitLabel(window.windowDurationMins, index === 0 ? 'Primary' : 'Secondary'),
+                    usedPercent,
+                    ...(!(resetsAt === undefined) ? { resetsAt } : {}),
+                },
+            ];
+        }));
+    }
+    const credits = (response.rateLimitsByLimitId?.['codex'] ?? response.rateLimits)?.credits;
+    if (credits?.hasCredits) {
+        if (credits.unlimited) {
+            rows.push({
+                label: 'Credits',
+                usedPercent: 0,
+                valueLabel: 'Unlimited',
+            });
+        }
+        else if (credits.balance !== null) {
+            const balance = Math.max(0, Math.floor(Number(credits.balance)));
+            if (Number.isFinite(balance)) {
+                rows.push({
+                    label: 'Credits',
+                    usedPercent: 0,
+                    valueLabel: `$${(balance * CREDIT_USD_RATE).toFixed(2)} · ${balance} credits`,
+                });
+            }
+        }
+    }
+    const resets = response.rateLimitResetCredits;
+    const availableResets = Number(resets?.availableCount);
+    if (Number.isFinite(availableResets) && availableResets > 0) {
+        const resetCredits = resets?.credits?.flatMap((credit) => {
+            const parsed = CodexResetCreditSchema.safeParse(credit);
+            if (!parsed.success)
+                return [];
+            const { id, expiresAt } = parsed.data;
+            return [
+                {
+                    ...(id === undefined ? {} : { id }),
+                    expiresAt: expiresAt === null ? null : expiresAt * 1000,
+                },
+            ];
+        });
+        rows.push({
+            label: 'Rate limit resets',
+            usedPercent: 0,
+            valueLabel: `${Math.floor(availableResets)} available`,
+            action: 'consume-reset',
+            ...(resetCredits?.length ? { resetCredits } : {}),
+        });
+    }
+    return rows;
+}
+function finitePercent(value) {
+    return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : undefined;
+}
+function resetTimestamp(value) {
+    if (value === null || !Number.isFinite(value) || value <= 0)
+        return undefined;
+    return value < 1_000_000_000_000 ? value * 1000 : value;
+}
+function titleCaseLimitId(limitId) {
+    return limitId
+        .split(/[_-]+/)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+/**
+ * Friendly names for the two weekly windows this account actually shows: the
+ * main codex quota reads "Weekly", the Spark quota "Weekly Spark".
+ * Every other bucket or window keeps the raw duration label.
+ */
+function friendlyLimitLabel(limitId, limitName, windowDurationMins) {
+    if (windowDurationMins !== 7 * 24 * 60)
+        return undefined;
+    if (limitId === 'codex')
+        return 'Weekly';
+    if (limitId === 'spark' || limitName?.toLowerCase().includes('spark'))
+        return 'Weekly Spark';
+    return undefined;
+}
+function rateLimitLabel(minutes, fallback) {
+    if (minutes === null || !Number.isFinite(minutes) || minutes <= 0) {
+        return `${fallback} limit`;
+    }
+    if (minutes % 1440 === 0)
+        return `${minutes / 1440} day${minutes === 1440 ? '' : 's'}`;
+    if (minutes % 60 === 0)
+        return `${minutes / 60} hour${minutes === 60 ? '' : 's'}`;
+    return `${minutes} minutes`;
+}
+//# sourceMappingURL=adapter.js.map

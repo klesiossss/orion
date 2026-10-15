@@ -1,0 +1,1749 @@
+/* Right-side workspace tools. Kept in one lazy chunk so the normal chat path
+   does not parse or style review, file tree, browser or terminal surfaces. */
+
+.workspace-panel {
+  position: relative;
+  z-index: 3;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  visibility: hidden;
+  overflow: visible;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate3d(24px, 0, 0);
+  transition:
+    opacity var(--dur-slow) var(--ease-out),
+    transform var(--dur-slow) var(--ease-rail),
+    visibility 0s linear var(--dur-slow);
+  /* The tools lay out against the panel's own width, which the user drags,
+     not against the window's. Width rules every host shares query
+     workspace-panel; layouts that trade width for height, which only the
+     full-height right host has, query workspace-panel-right. */
+  container: workspace-panel workspace-panel-right / inline-size;
+}
+
+.workspace-panel.is-open {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate3d(0, 0, 0);
+  transition-delay: 0s;
+}
+
+.workspace-panel:not(.is-open) {
+  overflow: hidden;
+}
+
+.workspace-panel.is-expanded {
+  border-left: 0;
+}
+
+.workspace-panel__resize {
+  position: absolute;
+  z-index: 8;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.workspace-panel.is-expanded .workspace-panel__resize {
+  display: none;
+}
+
+.workspace-panel__body {
+  min-width: 0;
+  min-height: 0;
+  contain: layout paint;
+  overflow: hidden;
+}
+
+.workspace-panel__surface {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-panel__surface[hidden] {
+  display: none;
+}
+
+.workspace-panel__loading {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.workspace-panel__loading-bar {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-panel__loading .skeleton-row {
+  padding-inline: 14px;
+}
+
+.workspace-empty {
+  display: grid;
+  height: 100%;
+  place-content: center;
+  justify-items: center;
+  gap: 9px;
+  padding: 28px;
+  color: var(--text-3);
+  text-align: center;
+}
+
+.workspace-empty strong {
+  color: var(--text);
+  font-size: var(--t-lg);
+  font-weight: 540;
+}
+
+.workspace-empty span {
+  max-width: 340px;
+  font-size: var(--t-sm);
+  line-height: 1.5;
+}
+
+.workspace-terminal {
+  height: 100%;
+  min-height: 0;
+  background: var(--terminal-workspace-bg);
+}
+
+.workspace-provider-login {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+  background: var(--terminal-workspace-bg);
+}
+
+.workspace-provider-login > .install-terminal {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  padding: 12px;
+  background: var(--terminal-workspace-bg);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.workspace-provider-login__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  padding-inline: 8px;
+}
+
+.workspace-tabs__add:has(.workspace-provider-login__actions) {
+  display: flex;
+  align-items: center;
+  flex: 1;
+}
+
+.workspace-provider-login__actions > button {
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.workspace-provider-login__actions > button:hover:not(:disabled) {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-provider-login__actions > button:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.workspace-provider-login__actions > button:disabled {
+  opacity: 0.5;
+}
+
+.terminal-pane--workspace {
+  height: 100%;
+  min-height: 0;
+  background: var(--terminal-workspace-bg);
+  border-top: 0;
+  animation: none;
+}
+
+.terminal-pane--workspace .terminal-pane__viewport {
+  padding: 12px 14px;
+  background: var(--terminal-workspace-bg);
+}
+
+/* ---------- review ---------- */
+
+.workspace-review {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-review__toolbar {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-review__branch,
+.workspace-review__stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.workspace-review__branch {
+  min-width: 0;
+}
+
+.workspace-review__branch > svg {
+  flex: none;
+}
+
+.workspace-review__branch strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--t-md);
+  font-weight: 540;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-review__stats {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  white-space: nowrap;
+}
+
+.workspace-review .is-add {
+  color: var(--success);
+}
+
+.workspace-review .is-delete {
+  color: var(--error);
+}
+
+.workspace-review__file-count {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+}
+
+.workspace-review__generate-commit {
+  display: inline-flex;
+  flex: none;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  background: var(--chrome-raised);
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--chrome-shadow);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-xs);
+}
+
+.workspace-review__generate-commit:hover:not(:disabled) {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-review__generate-commit:disabled {
+  color: var(--text-3);
+  cursor: default;
+  opacity: 0.58;
+}
+
+.workspace-review__notices {
+  display: grid;
+}
+
+.workspace-review__commit-draft {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px 10px 16px;
+  background: color-mix(in srgb, var(--surface-2) 76%, transparent);
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-review__commit-draft pre {
+  min-width: 0;
+  margin: 0;
+  overflow: auto;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.workspace-review__commit-draft button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.workspace-review__commit-draft button:hover,
+.workspace-review__commit-draft button:focus-visible {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-review__split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(230px, 31%, 340px);
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-review__diff {
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+  scrollbar-color: var(--surface-3) transparent;
+}
+
+.workspace-review__code-view {
+  position: relative;
+}
+
+.workspace-review__file {
+  width: 100%;
+  min-width: 0;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 440px;
+  border-bottom: 1px solid var(--line);
+  scroll-margin-top: 0;
+}
+
+.workspace-review__file > header {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(12px);
+}
+
+.workspace-review__file > header .md-file-ref__icon,
+.workspace-review__tree .md-file-ref__icon {
+  display: inline-grid;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+}
+
+.workspace-review__file > header .md-file-ref__icon > svg,
+.workspace-review__tree .md-file-ref__icon > svg,
+.workspace-files .md-file-ref__icon > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  stroke-width: 1.8;
+}
+
+.workspace-review__file > header strong {
+  overflow: hidden;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-review__file-stats {
+  display: inline-flex;
+  flex: none;
+  gap: 6px;
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+}
+
+.workspace-review__hunk-header,
+.workspace-review__unchanged {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  padding: 0 12px 0 92px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+}
+
+.workspace-review__unchanged {
+  gap: 7px;
+  padding-left: 34px;
+  background: var(--surface);
+}
+
+.workspace-review__line {
+  display: grid;
+  grid-template-columns: 46px 46px minmax(0, 1fr);
+  min-height: 23px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 23px;
+}
+
+.workspace-review__line.is-addition {
+  background: color-mix(in srgb, var(--success) 15%, transparent);
+}
+
+.workspace-review__line.is-deletion {
+  background: color-mix(in srgb, var(--error) 16%, transparent);
+}
+
+.workspace-review__gutter {
+  padding-right: 10px;
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+  color: var(--text-3);
+  text-align: right;
+  user-select: none;
+}
+
+.workspace-review__line code {
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 14px 0 9px;
+  color: inherit;
+  font: inherit;
+  white-space: pre;
+}
+
+.workspace-review__line code i {
+  display: inline-block;
+  width: 18px;
+  color: var(--text-3);
+  font-style: normal;
+  user-select: none;
+}
+
+.workspace-review__tree {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 12px 8px;
+  scrollbar-color: var(--surface-3) transparent;
+}
+
+.workspace-tree-search {
+  display: flex;
+  height: 32px;
+  align-items: center;
+  gap: 7px;
+  margin: 0 2px 9px;
+  padding: 0 9px;
+  background: var(--chrome-recessed);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  color: var(--text-3);
+}
+
+.workspace-tree-search:focus-within {
+  border-color: var(--line-strong);
+  color: var(--text-2);
+}
+
+.workspace-tree-search input {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+}
+
+.workspace-review__tree-list {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  scrollbar-color: var(--surface-3) transparent;
+}
+
+.workspace-review__tree-list.is-virtual {
+  position: relative;
+  display: block;
+}
+
+.workspace-review__tree-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.workspace-review__tree-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+.workspace-review__tree-folder > button,
+.workspace-review__tree-file {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 29px;
+  align-items: center;
+  gap: 6px;
+  padding-top: 0;
+  padding-right: 7px;
+  padding-bottom: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+  text-align: left;
+}
+
+.workspace-review__tree-folder > button:hover,
+.workspace-review__tree-file:hover {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-review__tree-folder button > span:not(.icon-morph),
+.workspace-review__tree-file > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-review__tree-file > i {
+  flex: none;
+  margin-left: auto;
+  color: var(--attention);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.workspace-review__tree-file > i[data-status='added'] {
+  color: var(--success);
+}
+
+.workspace-review__tree-file > i[data-status='deleted'] {
+  color: var(--error);
+}
+
+.workspace-review__message {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 12px;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+}
+
+/* Stands in the diff column while the first snapshot loads. */
+.workspace-review__skeleton {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Keep room for the branch name before the commit button's label. */
+@container workspace-panel (max-width: 460px) {
+  .workspace-review__generate-label {
+    display: none;
+  }
+}
+
+/* Narrower than its default width the right panel cannot give the diff a
+   readable column beside a 230px tree, so the tree moves underneath. */
+@container workspace-panel-right (max-width: 500px) {
+  .workspace-review__split {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 210px;
+  }
+
+  .workspace-review__tree {
+    border-top: 1px solid var(--line);
+  }
+
+  .workspace-review__diff {
+    border-right: 0;
+  }
+}
+
+/* ---------- files ---------- */
+
+.workspace-files {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-files__toolbar {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-2);
+  font-size: var(--t-sm);
+}
+
+.workspace-files__toolbar > span:first-of-type {
+  flex: none;
+  color: var(--text);
+  font-weight: 520;
+}
+
+.workspace-files__crumb {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-3);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-files__split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(230px, 32%, 360px);
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-files__viewer {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--line);
+}
+
+.workspace-files__loading {
+  display: flex;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+}
+
+.workspace-files__tree {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 12px 8px;
+  scrollbar-color: var(--surface-3) transparent;
+}
+
+.workspace-files__tree-list {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  scrollbar-color: var(--surface-3) transparent;
+}
+
+.workspace-files__tree-list.is-virtual {
+  position: relative;
+  display: block;
+}
+
+.workspace-files__tree-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.workspace-files__tree-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 29px;
+}
+
+.workspace-files__entry {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 29px;
+  align-items: center;
+  gap: 6px;
+  padding-top: 0;
+  padding-right: 8px;
+  padding-bottom: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+  text-align: left;
+}
+
+.workspace-files__entry:hover:not(:disabled),
+.workspace-files__entry.is-selected {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-files__entry:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.workspace-files__entry > span:not(.md-file-ref__icon, .icon-morph) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-files__entry > .workspace-files__name {
+  display: flex;
+  flex: 1 1 auto;
+  text-overflow: clip;
+}
+
+.workspace-files__name-start {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-files__name-end {
+  flex: none;
+  white-space: nowrap;
+}
+
+.workspace-files__entry > svg:last-child {
+  flex: none;
+  margin-left: auto;
+}
+
+.workspace-files__tree .md-file-ref__icon {
+  display: inline-grid;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+}
+
+.workspace-files__tree .md-file-ref__icon > svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.75;
+}
+
+.workspace-files__tree-error {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  color: var(--error);
+  font-size: var(--t-xs);
+}
+
+/* Placeholder rows share the entry's height and inset so the listing fills
+   in without shifting. */
+.workspace-files__tree-skeleton .skeleton-row {
+  min-height: 29px;
+  gap: 6px;
+  padding: 0 8px 0 12px;
+}
+
+.workspace-files__document {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-files__document > header {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: var(--t-xs);
+}
+
+.workspace-files__document > header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-files__document > header > span:not(.md-file-ref__icon) {
+  flex: none;
+  margin-left: auto;
+}
+
+/* Placeholder icon and name sit where the real ones do, not in the trailing slot. */
+.workspace-files__document-skeleton > header > span.skeleton {
+  margin-left: 0;
+}
+
+.workspace-files__document > header em {
+  flex: none;
+  color: var(--attention);
+  font-style: normal;
+}
+
+.workspace-code {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  color: var(--text-2);
+  scrollbar-color: var(--surface-3) transparent;
+  user-select: text;
+}
+
+.workspace-code__canvas {
+  position: relative;
+  min-width: max-content;
+}
+
+.workspace-code__line {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  grid-template-columns: 58px minmax(max-content, 1fr);
+  width: max-content;
+  min-width: 100%;
+  height: 22px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 22px;
+}
+
+.workspace-code__line > span {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  padding-right: 12px;
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+  color: var(--text-3);
+  text-align: right;
+  user-select: none;
+}
+
+.workspace-code__line > code {
+  padding: 0 16px;
+  color: inherit;
+  font: inherit;
+  white-space: pre;
+}
+
+@container workspace-panel-right (max-width: 500px) {
+  .workspace-files__split {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 220px;
+  }
+
+  .workspace-files__tree {
+    border-top: 1px solid var(--line);
+  }
+
+  .workspace-files__viewer {
+    border-right: 0;
+  }
+}
+
+/* ---------- browser ---------- */
+
+.workspace-browser {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.workspace-browser__toolbar {
+  display: flex;
+  min-width: 0;
+  min-height: 48px;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-browser__toolbar > button,
+.workspace-browser__address button,
+.workspace-browser__viewports button {
+  display: grid;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.workspace-browser__toolbar button:hover:not(:disabled),
+.workspace-browser__toolbar button[aria-pressed='true'] {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-browser__toolbar button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.workspace-browser__address {
+  display: flex;
+  min-width: 150px;
+  height: 34px;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  margin: 0 4px;
+  padding: 0 3px 0 10px;
+  background: var(--chrome-recessed);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  color: var(--text-3);
+}
+
+.workspace-browser__address:focus-within {
+  border-color: var(--line-strong);
+}
+
+.workspace-browser__address input {
+  min-width: 0;
+  flex: 1;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+}
+
+.workspace-browser__address button {
+  width: 27px;
+  height: 27px;
+}
+
+.workspace-browser__viewports {
+  display: flex;
+  flex: none;
+  gap: 1px;
+  padding-left: 5px;
+  border-left: 1px solid var(--line);
+}
+
+.workspace-browser__viewports button {
+  width: 28px;
+  height: 28px;
+}
+
+/* Too narrow for a usable address beside the preview sizes: the address
+   takes a row of its own under the navigation, so every control stays
+   reachable instead of the sizes being cut off at the panel edge. */
+@container workspace-panel (max-width: 420px) {
+  .workspace-browser__toolbar {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .workspace-browser__address {
+    order: 1;
+    min-width: 0;
+    flex-basis: 100%;
+    margin: 0;
+  }
+
+  .workspace-browser__viewports {
+    margin-left: auto;
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+
+.workspace-browser__canvas {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    linear-gradient(
+      90deg,
+      transparent 49.9%,
+      color-mix(in srgb, var(--line) 28%, transparent) 50%,
+      transparent 50.1%
+    ),
+    var(--bg);
+}
+
+.workspace-browser__guest-host {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 100%;
+  height: 100%;
+  min-width: 1px;
+  min-height: 1px;
+  overflow: hidden;
+  /* The page paints over this; until it does, and around a fixed preview size,
+     the canvas follows the theme instead of flashing a dark box in light mode. */
+  background: var(--bg);
+  border: 1px solid var(--line);
+  transform: translate(-50%, -50%);
+}
+
+.workspace-browser__canvas[data-viewport='fluid'] .workspace-browser__guest-host {
+  border: 0;
+}
+
+.workspace-browser__guest {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 1px;
+  min-height: 1px;
+  background: var(--bg);
+  border: 0;
+  transform-origin: top left;
+}
+
+.workspace-browser__guest-host[data-visible='false'] .workspace-browser__guest {
+  visibility: hidden;
+}
+
+.workspace-browser__placeholder {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.workspace-browser__skeleton {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  overflow: hidden;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.workspace-browser__skeleton-header {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-browser__skeleton-body {
+  display: grid;
+  width: 100%;
+  max-width: 560px;
+  gap: 16px;
+  margin-inline: auto;
+}
+
+.workspace-browser__skeleton-body .skeleton-lines {
+  gap: 11px;
+}
+
+.workspace-browser__skeleton-body .skeleton-lines > .skeleton {
+  height: 11px;
+}
+
+.workspace-browser__skeleton-media {
+  width: 100%;
+  max-height: 200px;
+  aspect-ratio: 16 / 9;
+}
+
+/* A notice about the toolbar (an address it refused). Neutral: nothing is broken. */
+.workspace-browser__error {
+  position: absolute;
+  z-index: 3;
+  top: 12px;
+  left: 50%;
+  max-width: min(540px, calc(100% - 24px));
+  padding: 8px 11px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-raised);
+  color: var(--text-2);
+  font-size: var(--t-xs);
+  line-height: 1.45;
+  transform: translateX(-50%);
+}
+
+/* A page that failed to load: a calm state in place of the guest, which stays hidden. */
+.workspace-browser__failure {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  background: var(--bg);
+}
+
+.workspace-browser__failure .workspace-empty strong {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.workspace-browser__failure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* Later loads keep the page visible; a thin line says something is on its way. */
+.workspace-browser__progress {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.workspace-browser__progress::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 36%;
+  background: var(--text-3);
+  content: '';
+  /* Linear: an eased sweep spends most of its time parked past an edge. */
+  animation: workspace-browser-progress 1.4s linear infinite;
+}
+
+@keyframes workspace-browser-progress {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(280%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-browser__progress::before {
+    width: 100%;
+    opacity: 0.5;
+    animation: none;
+  }
+}
+
+/* ---------- side chat ---------- */
+
+.workspace-side-chat {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-side-chat__conversation {
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.workspace-side-chat__conversation > .thread-shell {
+  height: 100%;
+}
+
+.workspace-side-chat__conversation .thread,
+.workspace-side-chat__skeleton .thread-skeleton {
+  padding-top: 12px;
+  font-size: var(--t-md);
+}
+
+.workspace-side-chat__conversation .thread__col,
+.workspace-side-chat__skeleton .thread-skeleton__col {
+  max-width: 720px;
+  padding-inline: 24px;
+}
+
+.workspace-side-chat__skeleton,
+.workspace-side-chat__skeleton > div,
+.workspace-side-chat__skeleton .thread-skeleton {
+  height: 100%;
+}
+
+.workspace-side-chat__skeleton .thread-skeleton {
+  animation: none;
+}
+
+.workspace-side-chat__error {
+  position: absolute;
+  z-index: 3;
+  top: 10px;
+  left: 50%;
+  display: flex;
+  width: max-content;
+  max-width: calc(100% - 24px);
+  align-items: flex-start;
+  gap: 7px;
+  padding: 7px 9px;
+  background: color-mix(in srgb, var(--error) 9%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--error) 26%, var(--line));
+  border-radius: var(--r-md);
+  color: var(--error);
+  font-size: var(--t-xs);
+  line-height: 1.4;
+  transform: translateX(-50%);
+}
+
+.workspace-side-chat__error svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.workspace-side-chat__composer {
+  position: relative;
+  width: calc(100% - 48px);
+  max-width: var(--chat-w);
+  margin: 4px auto 12px;
+  background: var(--bg-prompt);
+  border: 1px solid var(--line);
+  border-radius: var(--r-composer);
+  box-shadow: var(--composer-shadow);
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.workspace-side-chat__composer:focus-within {
+  border-color: var(--line-strong);
+}
+
+.workspace-side-chat__composer textarea {
+  width: 100%;
+  min-height: 68px;
+  resize: none;
+  padding: 16px 48px 12px 18px;
+  background: transparent;
+  border: 0;
+  border-radius: inherit;
+  outline: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.workspace-side-chat__composer button {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: grid;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  padding: 0;
+  background: var(--text);
+  border: 0;
+  border-radius: var(--r-pill);
+  color: var(--bg);
+  cursor: pointer;
+}
+
+.workspace-side-chat__composer button:disabled {
+  cursor: default;
+  opacity: 0.28;
+}
+
+/* The main chat's narrow gutters (chat-stage at 480px), which do not reach
+   this panel: it is not inside the stage. */
+@container workspace-panel (max-width: 480px) {
+  .workspace-side-chat__conversation .thread__col,
+  .workspace-side-chat__skeleton .thread-skeleton__col {
+    padding-inline: 14px;
+  }
+
+  .workspace-side-chat__composer {
+    width: calc(100% - 28px);
+  }
+}
+
+.workspace-selector {
+  display: grid;
+  height: 100%;
+  place-items: center;
+  padding: 24px;
+}
+
+.workspace-selector__list {
+  display: grid;
+  width: min(100%, 420px);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.workspace-selector__list > button {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  min-height: 52px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 13px;
+  background: var(--bg-rail);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 500;
+  line-height: 1.25;
+  text-align: left;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.workspace-selector__list > button:last-child:nth-child(odd) {
+  width: calc((100% - 6px) / 2);
+  grid-column: 1 / -1;
+  justify-self: center;
+}
+
+.workspace-selector__list > button:hover,
+.workspace-selector__list > button:focus-visible {
+  background: var(--surface);
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.workspace-selector__list > button:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.workspace-selector__list > button:hover {
+  outline: 0;
+}
+
+.workspace-selector__list > button > svg {
+  color: var(--text-3);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.workspace-selector__list > button:hover > svg,
+.workspace-selector__list > button:focus-visible > svg {
+  color: var(--text-2);
+}
+
+.workspace-selector__list > button > span {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Below this width two-column tiles get too tight for "Temporary chat", so
+   the right panel stacks the five tools into one column. */
+@container workspace-panel-right (max-width: 380px) {
+  .workspace-selector__list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace-selector__list > button:last-child:nth-child(odd) {
+    width: auto;
+    grid-column: auto;
+    justify-self: stretch;
+  }
+}
+
+@media (max-width: 900px) {
+  .workspace-panel {
+    border-left: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-panel {
+    transition: none;
+  }
+
+  .workspace-side-chat__composer button:not(:disabled):hover {
+    transform: none !important;
+  }
+}
+
+/* The bottom host uses the same tools and tab lifecycle as the right host.
+   It opens only about 260px tall, too short to stack a tree under a diff or
+   five launcher tiles in a column, so it answers only the shared width
+   rules. */
+.workspace-panel.workspace-panel--bottom {
+  width: 100%;
+  height: 100%;
+  border-left: 0;
+  transform: none;
+  container-name: workspace-panel;
+}
+
+.workspace-panel--bottom > .workspace-panel__resize {
+  top: 0;
+  right: 0;
+  bottom: auto;
+  left: 0;
+  width: 100%;
+  height: 6px;
+  cursor: ns-resize;
+}
+
+.stage__body.is-new-session > .bottom-terminal {
+  max-height: calc(100% - 80px);
+}
+
+.bottom-terminal.is-open {
+  contain: layout;
+  overflow: visible;
+}
+
+.workspace-panel--bottom .workspace-selector {
+  overflow-y: auto;
+}
+
+.workspace-panel__close {
+  position: absolute;
+  z-index: 9;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--bg);
+  color: var(--text-3);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.workspace-panel__close:hover,
+.workspace-panel__close:focus-visible {
+  background: var(--control-hover);
+  color: var(--text);
+}
+
+.workspace-tabs {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 4px;
+  padding: 6px 42px 6px 8px;
+  min-height: 40px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+/* Tabs keep their full labels while they fit. A crowded strip shrinks them,
+   but never past their content minimum: the icon, the close button and a
+   label's readable prefix plus an ellipsis. */
+.workspace-tabs__tab {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  max-width: 190px;
+  border-radius: var(--r-md);
+  color: var(--text-3);
+}
+.workspace-tabs__tab.is-active {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.workspace-tabs__tab button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--t-sm);
+}
+.workspace-tabs__label {
+  white-space: pre;
+}
+/* A long label keeps its first characters whole and lets only the rest give
+   way. The tail's track never drops below 1em, room for a whole ellipsis, so
+   the label's minimum is its prefix plus "…" and never a lone letter. */
+.workspace-tabs__label--split {
+  display: grid;
+  grid-template-columns: auto minmax(1em, auto);
+}
+.workspace-tabs__label-tail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Chromium never elides the first character of a line, so a tail that starts
+   with a letter would show that letter and a clipped ellipsis. A word joiner
+   has no width and no glyph; leading the tail with one lets the ellipsis stand
+   in for the whole tail. As generated content it stays out of the tab's text. */
+.workspace-tabs__label-tail::before {
+  content: '\2060';
+}
+.workspace-tabs__tab button svg {
+  flex: none;
+}
+.workspace-tabs__tab .workspace-tabs__close {
+  flex: none;
+  padding: 0 5px;
+}
+.workspace-tabs__add {
+  flex: none;
+}
+.workspace-tabs__add-button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+@media (hover: hover) and (pointer: fine) {
+  .workspace-tabs__tab:hover,
+  .workspace-tabs__add-button:hover {
+    background: var(--control-hover);
+    color: var(--text);
+  }
+}
+
+/* Compact, once even readable prefixes do not fit (data-fit is set by
+   fitWorkspaceTabs): inactive tabs keep only their icon, and their aria-label
+   and title still name them. The active tab keeps its label and close button
+   and takes the room that is left. */
+.workspace-tabs[data-fit='compact'] .workspace-tabs__tab:not(.is-active) {
+  flex: none;
+}
+.workspace-tabs[data-fit='compact'] .workspace-tabs__tab:not(.is-active) .workspace-tabs__label,
+.workspace-tabs[data-fit='compact'] .workspace-tabs__tab:not(.is-active) .workspace-tabs__close {
+  display: none;
+}
+/* Hovered or reached by keyboard, an inactive icon tab shows its close button
+   on a pill that reaches over the gap after it. The select button gives up 6px
+   and the close button adds 16px, so the 30px tab becomes 40px: 10px more,
+   which covers the 4px gap and 6px of the next tab's padding and leaves its
+   icon clear. The negative margin keeps the 30px footprint, so nothing beside
+   it moves. */
+.workspace-tabs[data-fit='compact']
+  .workspace-tabs__tab:not(.is-active):is(:hover, :has(:focus-visible)) {
+  position: relative;
+  z-index: 1;
+  margin-right: -10px;
+  background: linear-gradient(var(--control-hover) 0 0), var(--bg);
+  color: var(--text);
+}
+.workspace-tabs[data-fit='compact']
+  .workspace-tabs__tab:not(.is-active):is(:hover, :has(:focus-visible))
+  > [role='tab'] {
+  padding-right: 2px;
+}
+.workspace-tabs[data-fit='compact']
+  .workspace-tabs__tab:not(.is-active):is(:hover, :has(:focus-visible))
+  .workspace-tabs__close {
+  display: flex;
+  padding: 0 3px 0 0;
+}
+
+.workspace-tabs {
+  position: relative;
+}
+
+/* A crowded strip scrolls to show its newest tab. Fade the start edge once
+   tabs have scrolled past it, so a tab clipped there reads as more tabs that
+   way instead of a stray close button. The fade follows the strip's own
+   scroll position, so an unscrolled strip has none. */
+@property --workspace-tabs-fade {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+@keyframes workspace-tabs-fade {
+  to {
+    --workspace-tabs-fade: 32px;
+  }
+}
+@supports (animation-timeline: scroll()) {
+  .workspace-tabs {
+    mask-image: linear-gradient(to right, transparent, #000 var(--workspace-tabs-fade));
+    animation: workspace-tabs-fade linear both;
+    animation-timeline: scroll(self inline);
+    animation-range: 0 24px;
+  }
+}
+
+/* On the chat surface the stage's panel toggles stay fixed over this strip,
+   left of the close button: a 44px inset plus 28px buttons and 8px gaps.
+   End the strip 4px short of them rather than padding it, so tabs that
+   scroll are clipped there instead of sliding under the transparent
+   buttons; the padding keeps the add button the toggles' own 8px away. */
+.shell:has(> .panel-toggles.is-workspace-open)
+  .workspace-panel:not(.workspace-panel--bottom)
+  > .workspace-tabs {
+  margin-right: 76px;
+  padding-right: 4px;
+}
+
+.shell:has(> .panel-toggles.is-workspace-open > .panel-toggles__terminal)
+  .workspace-panel:not(.workspace-panel--bottom)
+  > .workspace-tabs {
+  margin-right: 112px;
+}
+.workspace-tabs__tab {
+  touch-action: pan-y;
+}
+.workspace-tabs.is-tab-reordering {
+  user-select: none;
+  cursor: grabbing;
+}
+.workspace-tabs__tab.is-tab-dragging {
+  position: relative;
+  z-index: 2;
+  background: var(--surface-2);
+  box-shadow: 0 2px 8px #0003;
+  transition: none;
+}
+.workspace-tabs__tab.is-tab-dragging button {
+  cursor: grabbing;
+}
+.workspace-tabs__tab.is-tab-shifting {
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.workspace-tabs__landing {
+  position: absolute;
+  left: 0;
+  top: 6px;
+  height: 28px;
+  border: 1px dashed var(--text-3);
+  border-radius: var(--r-md);
+  background: var(--control-hover);
+  pointer-events: none;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-tabs__tab.is-tab-shifting,
+  .workspace-tabs__landing {
+    transition: none;
+  }
+}

@@ -1,0 +1,54 @@
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it } from 'vitest'
+import {
+  avatarSeedName,
+  PROFILE_IMAGE_MAX_BYTES,
+  readProfileIdentityPreferences,
+  readProfileImage,
+  writeProfileIdentityPreferences,
+} from './profile-preferences.js'
+
+afterEach(() => localStorage.clear())
+
+describe('profile preferences', () => {
+  it('persists a bounded local identity', () => {
+    writeProfileIdentityPreferences({ displayName: '  Blue Emi  ', avatarDataUrl: undefined })
+
+    expect(readProfileIdentityPreferences()).toEqual({ displayName: 'Blue Emi' })
+  })
+
+  it('keeps the word the picture is struck from apart from the name', () => {
+    writeProfileIdentityPreferences({ displayName: 'Blue Emi', avatarSeed: '  harbor  ' })
+    const identity = readProfileIdentityPreferences()
+    expect(identity).toEqual({ displayName: 'Blue Emi', avatarSeed: 'harbor' })
+    expect(avatarSeedName(identity)).toBe('harbor')
+
+    writeProfileIdentityPreferences({ displayName: 'Blue Emi', avatarSeed: '   ' })
+    expect(readProfileIdentityPreferences()).toEqual({ displayName: 'Blue Emi' })
+    expect(avatarSeedName(readProfileIdentityPreferences())).toBe('Blue Emi')
+    expect(avatarSeedName({ displayName: ' ' })).toBe('Local profile')
+  })
+
+  it('accepts signed raster images and rejects unsafe or oversized files', async () => {
+    const png = new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      'avatar.png',
+      { type: 'image/png' },
+    )
+    await expect(readProfileImage(png)).resolves.toMatch(/^data:image\/png;base64,/u)
+
+    await expect(
+      readProfileImage(new File(['<svg/>'], 'avatar.svg', { type: 'image/svg+xml' })),
+    ).rejects.toThrow('PNG, JPEG, or WebP')
+    await expect(
+      readProfileImage(new File(['not an image'], 'avatar.png', { type: 'image/png' })),
+    ).rejects.toThrow('not a valid image')
+    await expect(
+      readProfileImage(
+        new File([new Uint8Array(PROFILE_IMAGE_MAX_BYTES + 1)], 'large.png', {
+          type: 'image/png',
+        }),
+      ),
+    ).rejects.toThrow('smaller than 1 MB')
+  })
+})
