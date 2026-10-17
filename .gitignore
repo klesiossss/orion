@@ -1,0 +1,29 @@
+node_modules/
+out/
+dist/
+release/
+emulator-data/
+*.log
+.DS_Store
+.env
+.env.local
+.vscode/
+.idea/
+coverage/
+.cache/
+.turbo/
+
+# Desktop installers — built by CI / `npm run package`, deployed to Firebase (never commit).
+web/public/downloads/*
+!web/public/downloads/.gitkeep
+
+# Source demo video duplicate (served copy lives in web/public/demo/).
+web/CondoLinkOficialProp.mp4
+
+# macOS signing — never commit certificates or keys.
+*.p12
+*.cer
+macos-signing-secrets/
+macos-signing-csr-*/
+private.key
+CertificateSigningRequest.certSigningRequest
